@@ -1,21 +1,21 @@
-# Portal Control System
+# Система контроля порталов
 
-A laboratory monitoring dashboard for magical portals. It helps operators estimate risk, control access, enforce action rules, and keep a reliable event history without mixing business logic with UI code.
+Панель мониторинга лабораторных магических порталов. Она помогает оператору оценивать риск, контролировать доступ, применять допустимые действия и сохранять надёжный журнал событий без смешивания бизнес-логики с интерфейсом.
 
-## Product goals
+## Цели продукта
 
-The application focuses on the core responsibilities of a lab watcher:
+Приложение сосредоточено на ключевых задачах наблюдателя лаборатории:
 
-- track portal stability and imminent collapse windows;
-- assess hazard severity using a transparent risk model;
-- decide whether passage is allowed, requires verification, or is forbidden;
-- permit only valid operational actions;
-- keep an event journal that explains how a portal reached its current state;
-- persist the dashboard state between browser reloads.
+- отслеживать стабильность порталов и время до возможного схлопывания;
+- оценивать опасность через понятную и прозрачную модель риска;
+- определять, разрешён ли проход, требуется ли проверка или проход запрещён;
+- разрешать только корректные рабочие операции;
+- вести журнал событий, который объясняет, как портал пришёл к текущему состоянию;
+- сохранять состояние панели между перезагрузками браузера.
 
-This version intentionally does not introduce a server, database, or external API layer because the required behavior can be implemented cleanly with local state and persistent browser storage.
+Эта версия сознательно не добавляет сервер, базу данных и внешние API, потому что все требования можно реализовать локально и безопасно через состояние приложения и browser storage.
 
-## Tech stack
+## Технологический стек
 
 - React
 - TypeScript
@@ -24,121 +24,121 @@ This version intentionally does not introduce a server, database, or external AP
 - Vitest
 - localStorage
 
-## Architecture
+## Архитектура
 
-- `src/types.ts` — central domain types.
-- `src/lib/portal-rules.ts` — risk model, access rules, action validation, summary calculations.
-- `src/lib/storage.ts` — safe localStorage read/write wrappers.
-- `src/data/demo-portals.ts` — demonstration data separated from operational storage state.
-- `src/App.tsx` — dashboard UI and workflow binding.
-- `src/lib/portal-rules.test.ts` — automated tests for critical business rules.
+- `src/types.ts` — основные типы доменной модели.
+- `src/lib/portal-rules.ts` — формула риска, правила доступа, проверка действий, сводка состояния.
+- `src/lib/storage.ts` — безопасные обёртки для чтения и записи в localStorage.
+- `src/data/demo-portals.ts` — демонстрационные данные, отделённые от пользовательских записей.
+- `src/App.tsx` — интерфейс панели и привязка действий к бизнес-логике.
+- `src/lib/portal-rules.test.ts` — автоматические тесты критических правил.
 
-The business rules are intentionally separated from the React UI layer so they remain testable without a browser and easy to replace if storage or interface technology changes.
+Бизнес-правила намеренно вынесены из React-компонентов, чтобы их можно было тестировать без браузера и легко менять способ хранения данных или интерфейс.
 
-## Risk formula
+## Формула риска
 
-The risk score is calculated in the `portal-rules` module and uses three factors:
+Оценка риска рассчитывается в модуле `portal-rules` и учитывает три фактора:
 
-- energy level (45% weight)
-- instability (100 - stability, 35% weight)
-- urgency until collapse (20% weight)
+- уровень энергии (вес 45%)
+- нестабильность (100 - stability, вес 35%)
+- срочность до схлопывания (вес 20%)
 
-Formula:
+Формула:
 
 `risk = clamp(round((energy * 0.45) + ((100 - stability) * 0.35) + ((1 - collapseWindow/180) * 100 * 0.20)), 0, 100)`
 
-Where:
+Где:
 
-- `energy` is portal energy in percent;
-- `stability` is the stability coefficient from 0 to 100;
-- `collapseWindow` is the remaining time before collapse in minutes;
-- the collapse window is normalized to an upper limit of 180 minutes for calibration.
+- `energy` — энергия портала в процентах;
+- `stability` — стабильность портала от 0 до 100;
+- `collapseWindow` — оставшееся время до схлопывания в минутах;
+- окно до схлопывания нормализовано до верхней границы 180 минут для прозрачной калибровки.
 
-Risk bands:
+Диапазоны риска:
 
-- low: 0-24
-- moderate: 25-49
-- high: 50-74
-- critical: 75-100
+- низкий: 0-24
+- средний: 25-49
+- высокий: 50-74
+- критический: 75-100
 
-This is not treated as a physical law; it is an operational risk model designed for lab decision support.
+Это не «физический закон», а рабочая модель оценки опасности для принятия решений в лаборатории.
 
-## Access policy
+## Политика допуска к проходу
 
-The "pass status" is independent from the general risk score.
+Статус прохода вычисляется отдельно от общего риска.
 
-A portal is:
+Портал может быть:
 
-- `allowed` when the risk is low, stability is acceptable, and the collapse window remains wide enough;
-- `requires_check` when the risk is moderate or there is insufficient operational margin;
-- `forbidden` when risk is critical, stability is too low, or the collapse window is too short.
+- `allowed` — если риск низкий, стабильность достаточна и окно до схлопывания достаточно широкое;
+- `requires_check` — если риск средний или запас по времени/стабильности недостаточен;
+- `forbidden` — если риск критический, стабильность слишком низкая или осталось слишком мало времени.
 
-Thresholds are centralized in `ACCESS_THRESHOLDS` and can be adjusted without editing the UI.
+Пороговые значения собраны в `ACCESS_THRESHOLDS` и могут быть изменены без правки пользовательского интерфейса.
 
-## Business rules
+## Бизнес-правила
 
-The following rules are enforced in business logic and not only through button disablement:
+Следующие правила защищены в бизнес-логике, а не только через отключение кнопок:
 
-- A closed portal cannot be stabilized.
-- A portal with critical risk cannot receive an observer.
-- A portal cannot be closed while creatures or personnel remain inside unless the closure is explicitly confirmed.
-- Closed portals cannot be moved to a review state.
-- Under-review status means an additional verification is required; no technical characteristics are changed automatically.
-- The dashboard summary always derives from the current portal list and never from stale data.
+- закрытый портал нельзя стабилизировать;
+- портал с критическим риском нельзя отправлять на обследование наблюдателем;
+- портал нельзя закрывать, пока внутри остаются существа или люди, без явного подтверждения;
+- закрытый портал нельзя перевести в статус проверки;
+- статус «под вопросом» означает, что состояние или безопасность портала требуют дополнительной проверки, но технические параметры не меняются автоматически;
+- сводка по порталам всегда вычисляется из текущего списка, а не из устаревших данных.
 
-## Local development
+## Локальная разработка
 
-1. Make sure Node.js and npm are available.
-2. Install dependencies:
+1. Убедитесь, что у вас установлен Node.js и npm.
+2. Установите зависимости:
 
 ```bash
 npm install
 ```
 
-3. Start the application:
+3. Запустите приложение:
 
 ```bash
 npm run dev -- --host 0.0.0.0
 ```
 
-4. Open the local URL displayed by Vite, usually `http://localhost:5173`.
+4. Откройте URL, который покажет Vite, обычно `http://localhost:5173`.
 
-## Tests
+## Тесты
 
 ```bash
 npm test
 ```
 
-The automated suite covers:
+Автоматический набор проверяет:
 
-- risk calculation and risk thresholds;
-- allow/requires-check/forbidden decisions;
-- invalid action rejection;
-- stabilization upgrades after intervention;
-- closure confirmation logic for occupied portals;
-- event log updates.
+- расчет риска и граничные значения;
+- решения по допуску (`allowed`, `requires_check`, `forbidden`);
+- отклонение недопустимых действий;
+- улучшение характеристик после стабилизации;
+- логику подтверждения закрытия занятых порталов;
+- обновление журнала событий.
 
-## Manual verification scenarios
+## Сценарии ручной проверки
 
-1. Open the portal list and confirm the summary cards match the visible records.
-2. Select a critical portal and verify the pass status changes to `forbidden` and the observer action is blocked.
-3. Stabilize a portal with high energy and check whether risk decreases, stability increases, and the journal adds an event.
-4. Attempt to close a portal with occupants without confirmation and verify the blocked action message appears.
-5. Close a portal with explicit confirmation and verify the status becomes closed and the collapse time resets to zero.
-6. Mark a portal as under review and confirm the status changes without modifying the underlying technical parameters.
-7. Refresh the page and verify the saved state still loads from localStorage.
-8. Simulate a storage write failure by temporarily disabling persistence in the browser and confirm the interface surfaces the warning.
+1. Откройте список порталов и проверьте, что карточки и сводка совпадают с фактическим состоянием.
+2. Выберите портал с критическим риском и убедитесь, что статус прохода становится `forbidden`, а действие отправки наблюдателя блокируется.
+3. Стабилизируйте портал с высокой энергией и проверьте, что риск уменьшается, стабильность растёт, а журнал событий пополняется.
+4. Попытайтесь закрыть портал с существами внутри без подтверждения и проверьте появление предупреждения.
+5. Закройте портал после явного подтверждения и убедитесь, что статус становится закрытым, а время до схлопывания сбрасывается в ноль.
+6. Отметьте портал как «под вопросом» и проверьте, что статус меняется без автоматической корректировки внутренних параметров.
+7. Обновите страницу и убедитесь, что сохранённое состояние загружается из localStorage.
+8. Временно имитируйте сбой записи в хранилище и проверьте, что интерфейс показывает предупреждение об ошибке.
 
-## Publication guidance
+## Подготовка к публикации
 
-The project is prepared to be published to Vercel or Netlify with the standard static site flow:
+Проект подготовлен к публикации на Vercel или Netlify по стандартной схеме статического сайта:
 
-- build command: `npm run build`
-- output folder: `dist`
+- команда сборки: `npm run build`
+- папка вывода: `dist`
 
-For Vercel, import the repository and set the framework to Vite. For Netlify, set the build command and publish directory accordingly.
+Для Vercel импортируйте репозиторий и выберите Vite как framework. Для Netlify укажите команду сборки и каталог публикации.
 
-## Notes
+## Примечания
 
-- Demo data is intentionally separate from user-created records and clearly labeled as a demonstration dataset.
-- The dashboard saves the current portal state in `localStorage` and safely falls back to the demo dataset if no saved data exists or if storage loading fails.
+- Демонстрационные данные вынесены отдельно от пользовательских записей и чётко помечены как демонстрационный набор.
+- Панель сохраняет текущее состояние порталов в `localStorage` и корректно возвращается к демо-данным, если сохранённые данные отсутствуют или загрузка хранилища нарушена.
