@@ -567,7 +567,7 @@ function App() {
                           <p className="text-xs uppercase tracking-[0.15em] text-slate-500">Приоритет {index + 1}</p>
                           <p className="mt-2 font-semibold text-white">{portal.name}</p>
                           <p className="mt-1 text-sm text-slate-300">
-                            `${riskLabels[evaluation.riskLevel]} риск · ${formatDuration(evaluation.remainingSeconds)} · внутри: ${portal.occupants}`
+                            {riskLabels[evaluation.riskLevel]} риск · {formatDuration(evaluation.remainingSeconds)} · внутри: {portal.occupants}
                           </p>
                           <p className="mt-2 text-sm leading-5 text-cyan-200">
                             {getRecommendedAction(portal, now)}

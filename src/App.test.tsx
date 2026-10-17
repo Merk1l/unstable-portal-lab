@@ -21,6 +21,12 @@ describe('панель управления', () => {
     expect(screen.getAllByRole('button').some((button) => button.textContent?.includes('A1'))).toBe(true);
     expect(screen.getByText('Очередь внимания')).toBeInTheDocument();
     expect(screen.queryByText(/демо|демонстрацион/i)).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText(
+        /^(Низкий|Средний|Высокий|Критический) риск · (\d+:\d{2}|\d+ сек|Закрыт) · внутри: \d+$/,
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/\$\{riskLabels/)).not.toBeInTheDocument();
     const portalList = within(
       screen.getByRole('complementary', { name: 'Список порталов по убыванию риска' }),
     );
