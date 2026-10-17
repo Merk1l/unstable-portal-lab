@@ -3,6 +3,7 @@ import tailwindcss from '@tailwindcss/vite'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
+  base: '/unstable-portal-lab/',
   plugins: [react(), tailwindcss()],
   test: {
     environment: 'jsdom',

@@ -164,4 +164,8 @@ git diff --check
 
 ## Публикация
 
-Исходный код размещён в [GitHub-репозитории Merk1l/unstable-portal-lab](https://github.com/Merk1l/unstable-portal-lab). Само приложение пока не опубликовано: GitHub Pages для репозитория не настроен, адрес `https://merk1l.github.io/unstable-portal-lab/` сейчас возвращает 404. Для публикации через GitHub Pages нужно настроить сборку и deploy workflow, а для Vite задать `base: '/unstable-portal-lab/'`. Для Vercel/Netlify команда сборки — `npm run build`, каталог — `dist`.
+Исходный код размещён в [GitHub-репозитории Merk1l/unstable-portal-lab](https://github.com/Merk1l/unstable-portal-lab). GitHub Actions workflow `.github/workflows/deploy.yml` проверяет тесты и lint, собирает приложение и публикует каталог `dist` в GitHub Pages при каждом push в `master`.
+
+Чтобы включить публикацию, в настройках репозитория откройте **Settings → Pages → Build and deployment → Source** и выберите **GitHub Actions**. После успешного запуска workflow сайт будет доступен по адресу <https://merk1l.github.io/unstable-portal-lab/>. Vite настроен на публикацию в подпапке репозитория через `base: '/unstable-portal-lab/'`.
+
+Для Vercel/Netlify команда сборки — `npm run build`, каталог — `dist`.
