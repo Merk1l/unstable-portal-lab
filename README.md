@@ -164,4 +164,4 @@ git diff --check
 
 ## Публикация
 
-Для Vercel/Netlify: команда сборки `npm run build`, каталог `dist`. Репозиторий пока не подключён к GitHub, приложение не опубликовано; публичных ссылок нет.
+Исходный код размещён в [GitHub-репозитории Merk1l/unstable-portal-lab](https://github.com/Merk1l/unstable-portal-lab). Само приложение пока не опубликовано: GitHub Pages для репозитория не настроен, адрес `https://merk1l.github.io/unstable-portal-lab/` сейчас возвращает 404. Для публикации через GitHub Pages нужно настроить сборку и deploy workflow, а для Vite задать `base: '/unstable-portal-lab/'`. Для Vercel/Netlify команда сборки — `npm run build`, каталог — `dist`.
