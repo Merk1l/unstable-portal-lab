@@ -1,98 +1,832 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ACCESS_THRESHOLDS,
+  advancePortals,
   applyPortalAction,
   calculateRisk,
+  cancelPortalOperation,
+  createPortal,
+  evaluatePortal,
   getAccessDecision,
+  getCollapseAt,
+  getEnergyAt,
+  getEnergyDrainRate,
+  getRecommendedAction,
+  getStabilizationPreview,
   getRiskLevel,
+  OPERATION_DURATIONS_MS,
+  OBSERVER_VISIT_DURATION_MS,
+  recordBlockedAction,
+  RISK_THRESHOLDS,
   summarizePortals,
 } from './portal-rules';
 import type { Portal } from '../types';
+import { loadPortals, savePortals, STORAGE_KEY } from './storage';
+
+const now = Date.now();
 
 const basePortal: Portal = {
   id: 'portal-01',
-  name: 'Test Gate',
-  destination: 'Altoria',
+  name: 'Тестовый портал',
+  destination: 'Альтория',
   energyLevel: 68,
   stability: 54,
   timeToCollapseMinutes: 38,
+  collapseEstimateUpdatedAt: new Date(now).toISOString(),
+  collapseDeadlineAt: null,
   occupants: 2,
   currentStatus: 'open',
-  notes: 'Ready for validation.',
-  lastUpdated: '2026-10-13T12:00:00.000Z',
+  notes: 'Портал готов к проверке.',
+  lastUpdated: new Date(now).toISOString(),
+  pendingOperation: null,
+  underQuestion: false,
+  observerVerifiedAt: null,
   eventLog: [],
 };
 
-describe('portal risk model', () => {
-  it('calculates an explainable risk score and assigns a low-risk band for stable portals', () => {
-    const stablePortal: Portal = {
-      ...basePortal,
-      energyLevel: 28,
-      stability: 88,
-      timeToCollapseMinutes: 120,
-    };
-
-    const risk = calculateRisk(stablePortal);
-
-    expect(risk).toBeGreaterThan(0);
-    expect(risk).toBeLessThan(ACCESS_THRESHOLDS.allowedMaxRisk + 10);
-    expect(getRiskLevel(risk)).toBe('low');
+describe('модель риска и допуска', () => {
+  it('проверяет границы уровней риска', () => {
+    expect(getRiskLevel(RISK_THRESHOLDS.moderate - 1)).toBe('low');
+    expect(getRiskLevel(RISK_THRESHOLDS.moderate)).toBe('moderate');
+    expect(getRiskLevel(RISK_THRESHOLDS.high)).toBe('high');
+    expect(getRiskLevel(RISK_THRESHOLDS.critical)).toBe('critical');
   });
 
-  it('marks high-energy, low-stability, short-window portals as critical risk', () => {
-    const criticalPortal: Portal = {
+  it('учитывает сокращение времени и количество находящихся внутри', () => {
+    const safe = {
       ...basePortal,
-      energyLevel: 92,
-      stability: 18,
-      timeToCollapseMinutes: 9,
-      occupants: 7,
+      energyLevel: 40,
+      stability: 90,
+      occupants: 0,
+      timeToCollapseMinutes: 60,
+    };
+    const crowdedShortWindow = {
+      ...safe,
+      occupants: 10,
+      timeToCollapseMinutes: 1,
     };
 
-    const risk = calculateRisk(criticalPortal);
-
-    expect(risk).toBeGreaterThan(75);
-    expect(getRiskLevel(risk)).toBe('critical');
+    expect(calculateRisk(crowdedShortWindow, now)).toBeGreaterThan(
+      calculateRisk(safe, now),
+    );
+    expect(getRiskLevel(calculateRisk(crowdedShortWindow, now))).toBe('critical');
   });
 
-  it('resolves access decisions based on risk, stability and collapse window', () => {
-    expect(getAccessDecision(basePortal)).toBe('requires_check');
-
-    const allowedPortal: Portal = {
+  it('повышает риск при снижении энергии при прочих равных', () => {
+    const portal: Portal = {
       ...basePortal,
-      energyLevel: 30,
-      stability: 78,
+      occupants: 0,
+      stability: 80,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const highEnergyRisk = calculateRisk({ ...portal, energyLevel: 80 }, now);
+    const lowEnergyRisk = calculateRisk({ ...portal, energyLevel: 20 }, now);
+
+    expect(lowEnergyRisk).toBeGreaterThan(highEnergyRisk);
+  });
+
+  it('разрешает, требует проверки или запрещает проход с учётом времени', () => {
+    const allowed: Portal = {
+      ...basePortal,
+      energyLevel: 90,
+      stability: 90,
+      occupants: 0,
       timeToCollapseMinutes: 90,
     };
+    const shortWindow = {
+      ...allowed,
+      timeToCollapseMinutes:
+        ACCESS_THRESHOLDS.allowedMinCollapseWindowMinutes - 1,
+    };
+    const critical = {
+      ...allowed,
+      stability: 20,
+      energyLevel: 20,
+      occupants: 10,
+      timeToCollapseMinutes: 10,
+    };
 
-    expect(getAccessDecision(allowedPortal)).toBe('allowed');
-  });
-
-  it('blocks a portal from stabilizing after closure', () => {
-    const closedPortal: Portal = { ...basePortal, currentStatus: 'closed' };
-
-    expect(() => applyPortalAction(closedPortal, 'stabilize')).toThrow(
-      'A closed portal cannot be stabilized.',
+    expect(getAccessDecision(allowed, now)).toBe('allowed');
+    expect(getAccessDecision(shortWindow, now)).toBe('requires_check');
+    expect(
+      getAccessDecision({ ...allowed, timeToCollapseMinutes: 14 }, now),
+    ).toBe('forbidden');
+    expect(getAccessDecision(critical, now)).toBe('forbidden');
+    expect(getAccessDecision({ ...allowed, currentStatus: 'closed' }, now)).toBe(
+      'forbidden',
+    );
+    expect(getAccessDecision({ ...allowed, currentStatus: 'collapsing' }, now)).toBe(
+      'forbidden',
     );
   });
 
-  it('requires explicit confirmation before closing a portal with occupants remaining inside', () => {
-    expect(() => applyPortalAction(basePortal, 'close')).toThrow(
-      'Portal cannot be closed while creatures or personnel remain inside without explicit confirmation.',
-    );
+  it('показывает активное схлопывание как критическое состояние и приоритет внимания', () => {
+    const collapsing: Portal = {
+      ...basePortal,
+      currentStatus: 'collapsing',
+      timeToCollapseMinutes: 0,
+      collapseDeadlineAt: new Date(now + 45_000).toISOString(),
+    };
+    const summary = summarizePortals([basePortal, collapsing], now);
 
-    const closed = applyPortalAction(basePortal, 'close', { confirmClose: true });
+    expect(evaluatePortal(collapsing, now).riskLevel).toBe('critical');
+    expect(summary.attentionPortals[0].id).toBe(collapsing.id);
+    expect(summary.criticalRisk).toBe(1);
+  });
+});
+
+describe('асинхронные операции', () => {
+  it('расходует энергию и пересчитывает прогноз после завершения стабилизации', () => {
+    const portal: Portal = {
+      ...basePortal,
+      energyLevel: 80,
+      stability: 50,
+      occupants: 0,
+      timeToCollapseMinutes: 80 / 1.5,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const started = applyPortalAction(portal, 'stabilize', { now });
+    expect(started.pendingOperation?.kind).toBe('stabilize');
+    expect(started.stability).toBe(portal.stability);
+    expect(started.eventLog[0].result).toBe('in_progress');
+    expect(getRecommendedAction(started)).toContain('Стабилизация выполняется');
+
+    const completed = advancePortals(
+      [started],
+      Date.parse(started.pendingOperation!.completesAt),
+    )[0];
+    expect(completed.pendingOperation).toBeNull();
+    expect(completed.stability).toBe(70);
+    expect(completed.energyLevel).toBeCloseTo(65);
+    expect(getEnergyDrainRate(completed)).toBeCloseTo(1.3);
+    expect(getCollapseAt(completed)! - Date.parse(completed.energyUpdatedAt!)).toBeCloseTo(
+      (65 / 1.3) * 60_000,
+    );
+  });
+
+  it('снижает скорость расхода энергии при повышении стабильности', () => {
+    const stable: Portal = {
+      ...basePortal,
+      occupants: 0,
+      energyLevel: 80,
+      stability: 100,
+      timeToCollapseMinutes: 80,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const unstable = { ...stable, stability: 50 };
+    expect(getEnergyDrainRate(stable)).toBe(1);
+    expect(getEnergyDrainRate(unstable)).toBe(1.5);
+    expect(getEnergyAt(stable, now + 60_000)).toBeCloseTo(79);
+    expect(getEnergyAt(unstable, now + 60_000)).toBeCloseTo(78.5);
+    expect(getCollapseAt(stable)! - now).toBe(80 * 60_000);
+    expect(getCollapseAt(unstable)! - now).toBeCloseTo((80 / 1.5) * 60_000);
+  });
+
+  it('показывает прогноз стабилизации и запрещает её при недостаточном запасе', () => {
+    const enough = {
+      ...basePortal,
+      energyLevel: 50,
+      stability: 70,
+      occupants: 0,
+      timeToCollapseMinutes: 50 / 1.3,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const preview = getStabilizationPreview(enough, now);
+    expect(preview.possible).toBe(true);
+    expect(preview.energyAfter).toBeCloseTo(35.4);
+    expect(preview.stabilityAfter).toBe(90);
+    expect(() =>
+      applyPortalAction(
+        { ...enough, energyLevel: 10, timeToCollapseMinutes: 10 / 1.3 },
+        'stabilize',
+        { now },
+      ),
+    ).toThrow('Недостаточно энергии');
+  });
+
+  it('позволяет отменить стабилизацию без изменения технических значений', () => {
+    const started = applyPortalAction(basePortal, 'stabilize');
+    const cancelled = cancelPortalOperation(started);
+
+    expect(cancelled.pendingOperation).toBeNull();
+    expect(cancelled.stability).toBe(basePortal.stability);
+    expect(cancelled.energyLevel).toBe(basePortal.energyLevel);
+    expect(cancelled.eventLog[0].action).toBe('cancel_operation');
+  });
+
+  it('закрывает портал через минуту и позволяет отменить закрытие', () => {
+    const started = applyPortalAction(basePortal, 'close', { confirmClose: true });
+    expect(started.currentStatus).toBe('open');
+    expect(started.pendingOperation?.kind).toBe('close');
+    expect(
+      Date.parse(started.pendingOperation!.completesAt) -
+        Date.parse(started.pendingOperation!.startedAt),
+    ).toBe(OPERATION_DURATIONS_MS.close);
+
+    const cancelled = cancelPortalOperation(started);
+    expect(cancelled.currentStatus).toBe('open');
+    expect(cancelled.pendingOperation).toBeNull();
+
+    const startedAgain = applyPortalAction(basePortal, 'close', { confirmClose: true });
+    const closed = advancePortals(
+      [startedAgain],
+      Date.parse(startedAgain.pendingOperation!.completesAt),
+    )[0];
     expect(closed.currentStatus).toBe('closed');
-    expect(closed.timeToCollapseMinutes).toBe(0);
+    expect(closed.occupants).toBe(basePortal.occupants);
+    expect(closed.closedAt).toBe(startedAgain.pendingOperation!.completesAt);
+    expect(closed.closureReason).toBe('manual_close');
   });
 
-  it('records new journal events and keeps summary counts aligned with the portal list', () => {
-    const stabilized = applyPortalAction(basePortal, 'stabilize');
-    expect(stabilized.eventLog[0].action).toBe('stabilize');
-    expect(stabilized.stability).toBeGreaterThan(basePortal.stability);
+  it('предупреждает и требует подтверждение, если внутри есть люди', () => {
+    expect(() => applyPortalAction(basePortal, 'close')).toThrow(
+      'Внутри остаются существа или люди.',
+    );
+  });
 
-    const summary = summarizePortals([stabilized]);
-    expect(summary.openPortals).toBe(1);
-    expect(summary.closedPortals).toBe(0);
+  it('переключает отметку «под вопросом» и записывает оба изменения', () => {
+    const started = applyPortalAction(basePortal, 'mark_under_review');
+    expect(started.currentStatus).toBe('open');
+    expect(started.underQuestion).toBe(true);
+    expect(started.eventLog[0].description).toContain('помечен');
+    const cleared = applyPortalAction(started, 'mark_under_review');
+    expect(cleared.underQuestion).toBe(false);
+    expect(cleared.eventLog[0].description).toContain('снята');
+  });
+
+  it('наблюдатель входит на 10 минут, учитывается внутри, возвращается и снимает требование проверки', () => {
+    const needsCheck: Portal = {
+      ...basePortal,
+      energyLevel: 20,
+      stability: 90,
+      occupants: 0,
+      timeToCollapseMinutes: 30,
+    };
+    expect(getAccessDecision(needsCheck, now)).toBe('requires_check');
+
+    const started = applyPortalAction(needsCheck, 'send_observer');
+    expect(started.pendingOperation?.kind).toBe('observer');
+    expect(started.occupants).toBe(1);
+    expect(started.stability).toBe(89);
+    expect(
+      Date.parse(started.pendingOperation!.completesAt) -
+        Date.parse(started.pendingOperation!.startedAt),
+    ).toBe(OBSERVER_VISIT_DURATION_MS);
+
+    const returned = advancePortals(
+      [started],
+      Date.parse(started.pendingOperation!.completesAt),
+    )[0];
+    expect(returned.pendingOperation).toBeNull();
+    expect(returned.occupants).toBe(0);
+    expect(returned.stability).toBe(88);
+    expect(returned.observerVerifiedAt).not.toBeNull();
+    expect(getAccessDecision(returned, Date.parse(returned.observerVerifiedAt!))).toBe('allowed');
+    const admitted = applyPortalAction(returned, 'record_occupant_entry', {
+      occupantCount: 1,
+      now: Date.parse(returned.observerVerifiedAt!),
+    });
+    expect(admitted.occupants).toBe(1);
+    expect(
+      getAccessDecision(admitted, Date.parse(returned.observerVerifiedAt!)),
+    ).toBe('allowed');
+  });
+
+  it('пускает наблюдателя в высокий, но не критический риск; блокирует критический риск и короткий таймер', () => {
+    const high: Portal = {
+      ...basePortal,
+      energyLevel: 30,
+      stability: 40,
+      occupants: 5,
+      timeToCollapseMinutes: 60,
+    };
+    expect(getRiskLevel(calculateRisk(high, now))).toBe('high');
+    expect(getAccessDecision(high, now)).toBe('forbidden');
+    expect(applyPortalAction(high, 'send_observer').pendingOperation?.kind).toBe('observer');
+    expect(() =>
+      applyPortalAction(high, 'record_occupant_entry', { occupantCount: 1 }),
+    ).toThrow('Вход запрещён');
+
+    const critical: Portal = {
+      ...basePortal,
+      energyLevel: 20,
+      stability: 12,
+      occupants: 8,
+      timeToCollapseMinutes: 5,
+    };
+    expect(() => applyPortalAction(critical, 'send_observer')).toThrow();
+    const blocked = recordBlockedAction(critical, 'send_observer', 'Вход запрещён.');
+    expect(blocked.eventLog[0].result).toBe('blocked');
+    expect(() =>
+      applyPortalAction({ ...high, timeToCollapseMinutes: 14 }, 'send_observer'),
+    ).toThrow('не менее 15 минут');
+  });
+
+  it('отмена визита наблюдателя немедленно возвращает его и уменьшает число внутри', () => {
+    const started = applyPortalAction(basePortal, 'send_observer');
+    const cancelled = cancelPortalOperation(started);
+    expect(cancelled.pendingOperation).toBeNull();
+    expect(cancelled.occupants).toBe(basePortal.occupants);
+    expect(cancelled.eventLog[0].description).toContain('досрочно вернулся');
+  });
+
+  it('не отменяет операцию после её завершения, даже до следующего обновления интерфейса', () => {
+    const needsCheck: Portal = {
+      ...basePortal,
+      energyLevel: 80,
+      stability: 90,
+      occupants: 0,
+      timeToCollapseMinutes: 80,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const started = applyPortalAction(needsCheck, 'send_observer', { now });
+    const completesAt = Date.parse(started.pendingOperation!.completesAt);
+    const afterCompletion = cancelPortalOperation(started, completesAt + 1_000);
+
+    expect(afterCompletion.pendingOperation).toBeNull();
+    expect(afterCompletion.occupants).toBe(0);
+    expect(afterCompletion.observerVerifiedAt).toBe(new Date(completesAt).toISOString());
+    expect(afterCompletion.eventLog[0].action).toBe('send_observer');
+    expect(afterCompletion.eventLog[0].result).toBe('completed');
+    expect(afterCompletion.eventLog.some((event) => event.action === 'cancel_operation')).toBe(false);
+  });
+
+  it('не позволяет отменой операции избежать уже наступившего схлопывания', () => {
+    const startedAt = now;
+    const startTime = new Date(startedAt).toISOString();
+    const closing: Portal = {
+      ...basePortal,
+      energyLevel: 0.5,
+      energyUpdatedAt: startTime,
+      baseEnergyDrainPerMinute: 1,
+      stability: 100,
+      occupants: 2,
+      currentStatus: 'open',
+      pendingOperation: {
+        kind: 'close',
+        startedAt: startTime,
+        completesAt: new Date(startedAt + OPERATION_DURATIONS_MS.close).toISOString(),
+        previousStatus: 'open',
+      },
+    };
+    const afterDeadline = cancelPortalOperation(
+      closing,
+      startedAt + OPERATION_DURATIONS_MS.close,
+    );
+
+    expect(afterDeadline.currentStatus).toBe('closed');
+    expect(afterDeadline.pendingOperation).toBeNull();
+    expect(afterDeadline.occupants).toBe(2);
+    expect(afterDeadline.lostOccupants).toBe(2);
+    expect(afterDeadline.eventLog[0].action).toBe('collapse_incident');
+    expect(afterDeadline.eventLog.some((event) => event.action === 'cancel_operation')).toBe(false);
+  });
+
+  it('не позволяет случайно списать наблюдателя как обычный выход', () => {
+    const solo = {
+      ...basePortal,
+      occupants: 0,
+      energyLevel: 90,
+      stability: 100,
+      timeToCollapseMinutes: 90,
+    };
+    const visiting = applyPortalAction(solo, 'send_observer');
+    expect(() =>
+      applyPortalAction(visiting, 'record_occupant_exit', { occupantCount: 1 }),
+    ).toThrow('наблюдатель ещё не вернулся');
+  });
+
+  it('фиксирует выход указанного количества и пересчитывает риск', () => {
+    const occupied = {
+      ...basePortal,
+      occupants: 3,
+      timeToCollapseMinutes: 1,
+      collapseEstimateUpdatedAt: new Date(now).toISOString(),
+    };
+    const beforeRisk = calculateRisk(occupied, now);
+    const afterExit = applyPortalAction(occupied, 'record_occupant_exit', {
+      occupantCount: 2,
+    });
+
+    expect(afterExit.occupants).toBe(1);
+    expect(afterExit.eventLog[0]).toMatchObject({
+      action: 'record_occupant_exit',
+      result: 'completed',
+    });
+    expect(calculateRisk(afterExit, now)).toBeLessThan(beforeRisk);
+    expect(() =>
+      applyPortalAction(afterExit, 'record_occupant_exit', { occupantCount: 2 }),
+    ).toThrow('внутри только 1.');
+  });
+
+  it('фиксирует несколько вошедших только если проход разрешён до и после входа', () => {
+    const safe: Portal = {
+      ...basePortal,
+      energyLevel: 90,
+      stability: 100,
+      occupants: 0,
+      timeToCollapseMinutes: 180,
+      collapseEstimateUpdatedAt: new Date(now).toISOString(),
+    };
+    const entered = applyPortalAction(safe, 'record_occupant_entry', {
+      occupantCount: 5,
+    });
+    expect(entered.occupants).toBe(5);
+    expect(entered.stability).toBe(95);
+    expect(entered.eventLog[0].description).toContain('вход 5');
+
+    expect(() =>
+      applyPortalAction({ ...safe, stability: 20 }, 'record_occupant_entry', {
+        occupantCount: 1,
+      }),
+    ).toThrow('Вход запрещён');
+    expect(() =>
+      applyPortalAction(safe, 'record_occupant_entry', { occupantCount: 0 }),
+    ).toThrow('положительное целое число');
+  });
+
+  it('немедленно закрывает портал при исчерпании энергии без дополнительного окна', () => {
+    const expiring: Portal = {
+      ...basePortal,
+      energyLevel: 0,
+      energyUpdatedAt: new Date(now - 5_000).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+      timeToCollapseMinutes: 0,
+      occupants: 3,
+    };
+    const closed = advancePortals([expiring], now)[0];
+    expect(closed.currentStatus).toBe('closed');
+    expect(closed.collapseDeadlineAt).toBeNull();
+    expect(closed.occupants).toBe(3);
+    expect(closed.lostOccupants).toBe(3);
+    expect(closed.eventLog[0]).toMatchObject({
+      portalId: expiring.id,
+      action: 'collapse_incident',
+      result: 'critical',
+      timestamp: new Date(now - 5_000).toISOString(),
+    });
+    expect(closed.eventLog[0].description).toContain(expiring.name);
+    expect(closed.eventLog[0].description).toContain('потеряны 3');
+    expect(closed.eventLog[0].description).toContain(
+      new Date(now - 5_000).toLocaleString('ru-RU'),
+    );
+
+    const processedAgain = advancePortals([closed], now + 60_000)[0];
+    expect(processedAgain).toBe(closed);
+    expect(processedAgain.lostOccupants).toBe(3);
+    expect(processedAgain.eventLog.filter((event) => event.action === 'collapse_incident')).toHaveLength(1);
+    const summary = summarizePortals([processedAgain], now);
+    expect(summary.openPortals).toBe(0);
+    expect(summary.closedPortals).toBe(1);
+    expect(summary.attentionPortals).toEqual([processedAgain]);
+  });
+
+  it('фиксирует оставшихся как потерянных, если выход снижает стабильность до нуля', () => {
+    const unstable = {
+      ...basePortal,
+      energyLevel: 80,
+      stability: 1,
+      occupants: 3,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const closed = applyPortalAction(unstable, 'record_occupant_exit', {
+      occupantCount: 1,
+    });
+
+    expect(closed.currentStatus).toBe('closed');
+    expect(closed.occupants).toBe(2);
+    expect(closed.lostOccupants).toBe(2);
+    expect(closed.stability).toBe(0);
+    expect(closed.eventLog[0]).toMatchObject({
+      action: 'collapse_incident',
+      result: 'critical',
+    });
+    expect(closed.eventLog[0].description).toContain('потеряны 2');
+    expect(closed.eventLog[1].action).toBe('record_occupant_exit');
+  });
+
+  it('схлопывает по рассчитанному времени и регистрирует оставшихся без окна задержки', () => {
+    const expiring: Portal = {
+      ...basePortal,
+      energyLevel: 1,
+      stability: 100,
+      occupants: 2,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+      timeToCollapseMinutes: 1,
+    };
+    const collapseAt = getCollapseAt(expiring)!;
+    const collapsed = advancePortals([expiring], collapseAt)[0];
+
+    expect(collapsed.currentStatus).toBe('closed');
+    expect(collapsed.occupants).toBe(2);
+    expect(collapsed.lostOccupants).toBe(2);
+    expect(collapsed.eventLog[0].result).toBe('critical');
+    expect(Date.parse(collapsed.eventLog[0].timestamp)).toBe(collapseAt);
+  });
+
+  it('при схлопывании без людей закрывает портал без происшествия', () => {
+    const empty: Portal = {
+      ...basePortal,
+      energyLevel: 0,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+      occupants: 0,
+    };
+    const closed = advancePortals([empty], now)[0];
+
+    expect(closed.currentStatus).toBe('closed');
+    expect(closed.occupants).toBe(0);
+    expect(closed.lostOccupants).toBe(0);
+    expect(closed.eventLog[0]).toMatchObject({
+      action: 'natural_collapse',
+      result: 'completed',
+    });
+    expect(closed.eventLog.some((event) => event.action === 'collapse_incident')).toBe(false);
+    expect(summarizePortals([closed], now).attentionPortals).toHaveLength(0);
+  });
+
+  it('не разрешает проход через портал, уже имеющий нулевую стабильность', () => {
+    const unstable = {
+      ...basePortal,
+      energyLevel: 80,
+      stability: 0,
+      occupants: 2,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    expect(() =>
+      applyPortalAction(unstable, 'record_occupant_exit', { occupantCount: 1 }),
+    ).toThrow('Портал уже достиг порога схлопывания');
+    expect(advancePortals([unstable], now)[0].currentStatus).toBe('closed');
+    expect(() => applyPortalAction(unstable, 'stabilize', { now })).toThrow(
+      'достиг порога немедленного схлопывания',
+    );
+  });
+
+  it('схлопывает сохранённое старое состояние без задержки', () => {
+    const legacyCollapsing: Portal = {
+      ...basePortal,
+      energyLevel: 0,
+      currentStatus: 'collapsing',
+      collapseDeadlineAt: new Date(now + 60_000).toISOString(),
+    };
+    const closed = advancePortals([legacyCollapsing], now)[0];
+    expect(closed.currentStatus).toBe('closed');
+    expect(closed.collapseDeadlineAt).toBeNull();
+    expect(closed.occupants).toBe(2);
+    expect(closed.lostOccupants).toBe(2);
+    expect(closed.eventLog[0].result).toBe('critical');
+    expect(closed.eventLog[0].description).toContain('потеряны 2');
+  });
+
+  it('не фиксирует выход из сохранённого состояния схлопывания', () => {
+    const legacyCollapsing: Portal = {
+      ...basePortal,
+      energyLevel: 40,
+      stability: 70,
+      currentStatus: 'collapsing',
+      collapseDeadlineAt: new Date(now + 60_000).toISOString(),
+    };
+
+    expect(() =>
+      applyPortalAction(legacyCollapsing, 'record_occupant_exit', {
+        occupantCount: 1,
+        now,
+      }),
+    ).toThrow('уже закрыт или схлопывается');
+  });
+
+  it('не позволяет начинать стабилизацию после исчерпания энергии', () => {
+    const almostCollapsed: Portal = {
+      ...basePortal,
+      occupants: 0,
+      energyLevel: 0,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+      timeToCollapseMinutes: 0,
+    };
+    expect(() => applyPortalAction(almostCollapsed, 'stabilize')).toThrow(
+      'достиг порога немедленного схлопывания',
+    );
+  });
+
+  it('сохраняет проверку риска, журнал и сводку при нескольких порталах', () => {
+    const stable = { ...basePortal, occupants: 0, stability: 90, energyLevel: 20 };
+    const critical = {
+      ...basePortal,
+      id: 'critical',
+      stability: 12,
+      energyLevel: 20,
+      timeToCollapseMinutes: 1,
+      occupants: 10,
+    };
+    const summary = summarizePortals([stable, critical], now);
+    expect(summary.openPortals).toBe(2);
+    expect(summary.criticalRisk).toBe(1);
+    expect(summary.attentionPortals[0].id).toBe('critical');
+  });
+
+  it('создаёт запись портала с начальным событием', () => {
+    const created = createPortal({
+      name: 'Новый шлюз',
+      destination: 'Тихая долина',
+      energyLevel: 40,
+      stability: 80,
+      occupants: 0,
+    });
+    expect(created.eventLog[0].action).toBe('create_portal');
+    expect(
+      createPortal({
+        name: 'Без энергии',
+        destination: 'Пустота',
+        energyLevel: 0,
+        stability: 80,
+        occupants: 0,
+      }).currentStatus,
+    ).toBe('closed');
+    expect(
+      createPortal({
+        name: 'Без стабильности',
+        destination: 'Пустота',
+        energyLevel: 80,
+        stability: 0,
+        occupants: 0,
+      }).currentStatus,
+    ).toBe('closed');
+    expect(() =>
+      createPortal({
+        name: ' ',
+        destination: '',
+        energyLevel: 101,
+        stability: 80,
+        occupants: 0,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('хранилище порталов', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it('сохраняет и затем читает пустой список как валидное состояние', () => {
+    expect(savePortals([]).ok).toBe(true);
+    expect(loadPortals([basePortal])).toMatchObject({
+      status: 'loaded',
+      portals: [],
+    });
+  });
+
+  it('добавляет новые поля наблюдения при чтении старого формата сохранённых порталов', () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        { schemaVersion: 1, portals: [basePortal] },
+        (key, value: unknown) =>
+          key === 'underQuestion' || key === 'observerVerifiedAt' ? undefined : value,
+      ),
+    );
+
+    expect(loadPortals([])).toMatchObject({
+      status: 'loaded',
+      portals: [
+        {
+          underQuestion: false,
+          observerVerifiedAt: null,
+          energyUpdatedAt: basePortal.collapseEstimateUpdatedAt,
+        },
+      ],
+    });
+    const migrated = loadPortals([]).portals[0];
+    expect(migrated.baseEnergyDrainPerMinute).toBeCloseTo(
+      basePortal.energyLevel /
+        basePortal.timeToCollapseMinutes /
+        (2 - basePortal.stability / 100),
+    );
+  });
+
+  it('мигрирует старое схлопывание с оставшимися внутри в критическое происшествие один раз', () => {
+    const collapseTimestamp = new Date(now - 60_000).toISOString();
+    const legacyCollapsed: Portal = {
+      ...basePortal,
+      currentStatus: 'closed',
+      occupants: 4,
+      eventLog: [
+        {
+          id: 'legacy-collapse',
+          timestamp: collapseTimestamp,
+          portalId: basePortal.id,
+          action: 'natural_collapse',
+          result: 'warning',
+          description: 'Портал схлопнулся; внутри оставалось 4 человек/существ.',
+        },
+      ],
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        schemaVersion: 1,
+        portals: [legacyCollapsed],
+      }),
+    );
+
+    const migrated = loadPortals([]).portals[0];
+    expect(migrated.occupants).toBe(4);
+    expect(migrated.lostOccupants).toBe(4);
+    expect(migrated.eventLog.filter((event) => event.action === 'collapse_incident')).toHaveLength(1);
+    expect(migrated.eventLog[0]).toMatchObject({
+      result: 'critical',
+      timestamp: collapseTimestamp,
+    });
+  });
+
+  it('восстанавливает число оставшихся из старого счётчика потерь и не дублирует происшествие', () => {
+    const incidentTimestamp = new Date(now - 30_000).toISOString();
+    const previousVersionPortal: Portal = {
+      ...basePortal,
+      currentStatus: 'closed',
+      occupants: 0,
+      lostOccupants: 3,
+      eventLog: [
+        {
+          id: 'existing-collapse-incident',
+          timestamp: incidentTimestamp,
+          portalId: basePortal.id,
+          action: 'collapse_incident',
+          result: 'critical',
+          description: 'Критическое происшествие: потеряны 3 человек/существ.',
+        },
+      ],
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [previousVersionPortal] }),
+    );
+
+    const migrated = loadPortals([]).portals[0];
+    expect(migrated.occupants).toBe(3);
+    expect(migrated.lostOccupants).toBe(3);
+    expect(migrated.eventLog.filter((event) => event.action === 'collapse_incident')).toHaveLength(1);
+
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [migrated] }),
+    );
+    const loadedAgain = loadPortals([]).portals[0];
+    expect(loadedAgain.occupants).toBe(3);
+    expect(loadedAgain.lostOccupants).toBe(3);
+    expect(loadedAgain.eventLog.filter((event) => event.action === 'collapse_incident')).toHaveLength(1);
+  });
+
+  it('исключает закрытые записи из текущего риска и очереди риска', () => {
+    const closedCritical: Portal = {
+      ...basePortal,
+      currentStatus: 'closed',
+      energyLevel: 0,
+      stability: 0,
+      occupants: 2,
+      lostOccupants: 2,
+    };
+    const summary = summarizePortals([closedCritical], now);
+    expect(summary.criticalRisk).toBe(0);
+    expect(summary.openPortals).toBe(0);
+    expect(summary.closedPortals).toBe(1);
+    expect(summary.attentionPortals).toEqual([closedCritical]);
+    expect(
+      summarizePortals(
+        [{ ...closedCritical, incidentReviewedAt: new Date(now).toISOString() }],
+        now,
+      ).attentionPortals,
+    ).toEqual([]);
+  });
+
+  it('не затирает повреждённую запись начальными данными', () => {
+    window.localStorage.setItem(STORAGE_KEY, '{bad json');
+    const result = loadPortals([basePortal]);
+    expect(result.status).toBe('error');
+    expect(result.warning).toContain('Исходные данные не изменены');
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe('{bad json');
+  });
+
+  it('возвращает ошибки чтения и записи хранилища', () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('storage denied');
+    });
+    expect(loadPortals([basePortal]).warning).toContain('storage denied');
+
+    vi.restoreAllMocks();
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('quota exceeded');
+    });
+    expect(savePortals([basePortal]).error).toContain('quota exceeded');
   });
 });

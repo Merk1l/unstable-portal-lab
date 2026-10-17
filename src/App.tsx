@@ -1,285 +1,1226 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 
-import { DEMO_PORTALS } from './data/demo-portals';
-import { applyPortalAction, evaluatePortal, summarizePortals } from './lib/portal-rules';
+import { INITIAL_PORTALS } from './data/initial-portals';
+import {
+  advancePortals,
+  applyPortalAction,
+  cancelPortalOperation,
+  createPortal,
+  evaluatePortal,
+  getEnergyAt,
+  getEnergyDrainRate,
+  getRecommendedAction,
+  getStabilizationPreview,
+  OPERATION_DURATIONS_MS,
+  recordBlockedAction,
+  summarizePortals,
+} from './lib/portal-rules';
 import { loadPortals, savePortals } from './lib/storage';
-import type { Portal, PortalAction } from './types';
+import type { Portal, PortalAction, PortalDraft, PortalEvent } from './types';
+
+type Screen = 'overview' | 'archive' | 'journal' | 'worklog';
+type PersistenceMode = 'persistent' | 'blocked_read' | 'blocked_write' | 'memory_only';
+type OccupantAdjustment = {
+  portalId: string;
+  action: 'record_occupant_entry' | 'record_occupant_exit';
+  count: string;
+};
+type CloseConfirmation = { portalId: string; name: string; occupants: number };
+const APP_START_TIME = Date.now();
 
 const actionLabels: Record<PortalAction, string> = {
-  stabilize: 'Stabilize',
-  close: 'Close',
-  send_observer: 'Send observer',
-  mark_under_review: 'Mark under review',
+  stabilize: 'Стабилизировать',
+  close: 'Закрыть портал',
+  send_observer: 'Отправить наблюдателя',
+  record_occupant_exit: 'Зафиксировать выход',
+  record_occupant_entry: 'Зафиксировать вход',
+  mark_under_review: 'Пометить под вопросом',
+  cancel_operation: 'Отменить операцию',
+  natural_collapse: 'Схлопывание',
+  collapse_incident: 'Происшествие при схлопывании',
+  create_portal: 'Добавить портал',
 };
 
-const riskStyles: Record<string, string> = {
+const riskLabels = {
+  low: 'Низкий',
+  moderate: 'Средний',
+  high: 'Высокий',
+  critical: 'Критический',
+} as const;
+
+const riskStyles = {
   low: 'bg-emerald-500/15 text-emerald-300 ring-1 ring-inset ring-emerald-500/40',
   moderate: 'bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-500/40',
   high: 'bg-orange-500/15 text-orange-300 ring-1 ring-inset ring-orange-500/40',
   critical: 'bg-rose-500/15 text-rose-300 ring-1 ring-inset ring-rose-500/40',
+} as const;
+
+const eventResultLabels: Record<PortalEvent['result'], string> = {
+  completed: 'Завершено',
+  blocked: 'Отклонено',
+  warning: 'Требует внимания',
+  critical: 'Критическое происшествие · требует внимания',
+  pending_review: 'Проверка ожидает',
+  in_progress: 'Выполняется',
+};
+
+const emptyDraft: PortalDraft = {
+  name: '',
+  destination: '',
+  energyLevel: 50,
+  stability: 70,
+  occupants: 0,
 };
 
 function formatTimestamp(value: string) {
-  return new Date(value).toLocaleString('ru-RU', {
-    dateStyle: 'short',
-    timeStyle: 'short',
-  });
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })
+    : 'Время неизвестно';
+}
+
+function formatDuration(seconds: number | null) {
+  if (seconds === null) {
+    return 'Закрыт';
+  }
+  if (seconds <= 0) {
+    return '0:00';
+  }
+  const wholeSeconds = Math.ceil(seconds);
+  if (wholeSeconds < 60) {
+    return `${wholeSeconds} сек`;
+  }
+  const minutes = Math.floor(wholeSeconds / 60);
+  const remainder = String(wholeSeconds % 60).padStart(2, '0');
+  return `${minutes}:${remainder}`;
+}
+
+function closureReasonLabel(reason: Portal['closureReason']) {
+  switch (reason) {
+    case 'manual_close':
+      return 'Закрыт смотрителем';
+    case 'energy_depleted':
+      return 'Энергия исчерпана';
+    case 'stability_depleted':
+      return 'Стабильность достигла 0%';
+    case 'legacy_collapse':
+      return 'Схлопнулся (историческая запись)';
+    default:
+      return 'Причина не указана';
+  }
 }
 
 function App() {
-  const [portals, setPortals] = useState<Portal[]>(() => loadPortals(DEMO_PORTALS));
-  const [selectedId, setSelectedId] = useState<string>(() => loadPortals(DEMO_PORTALS)[0]?.id ?? '');
+  const [initialData] = useState(() => loadPortals(INITIAL_PORTALS));
+  const [portals, setPortals] = useState<Portal[]>(initialData.portals);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialData.portals[0]?.id ?? null,
+  );
+  const [screen, setScreen] = useState<Screen>('overview');
   const [notice, setNotice] = useState<string | null>(null);
+  const [storageWarning, setStorageWarning] = useState(initialData.warning);
+  const [persistenceMode, setPersistenceMode] = useState<PersistenceMode>(
+    initialData.status === 'error' ? 'blocked_read' : 'persistent',
+  );
+  const [now, setNow] = useState(APP_START_TIME);
+  const [draft, setDraft] = useState<PortalDraft>(emptyDraft);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [occupantAdjustment, setOccupantAdjustment] = useState<OccupantAdjustment | null>(null);
+  const [closeConfirmation, setCloseConfirmation] = useState<CloseConfirmation | null>(null);
+  const [archiveSelectedId, setArchiveSelectedId] = useState<string | null>(null);
 
-  const storageWarning = savePortals(portals)
-    ? null
-    : 'Storage write failed. The latest portal states are not being persisted.';
+  useEffect(() => {
+    const clock = window.setInterval(() => {
+      setNow(Date.now());
+      const tickTime = Date.now();
+      setPortals((current) =>
+        advancePortals(current, tickTime),
+      );
+    }, 1_000);
+    return () => window.clearInterval(clock);
+  }, []);
 
-  const selectedPortal = portals.find((portal) => portal.id === selectedId) ?? portals[0] ?? null;
-  const summary = useMemo(() => summarizePortals(portals), [portals]);
-
-  const handleAction = (action: PortalAction, portal: Portal) => {
-    try {
-      const confirmClose = action === 'close' && portal.occupants > 0;
-      if (confirmClose && !window.confirm('Portal still contains creatures or personnel. Confirm closure anyway?')) {
-        return;
+  useEffect(() => {
+    if (persistenceMode !== 'persistent') {
+      return;
+    }
+    const saveTimer = window.setTimeout(() => {
+      const result = savePortals(portals);
+      if (!result.ok) {
+        setPersistenceMode('blocked_write');
+        setStorageWarning(
+          `${result.error} Текущие данные останутся в памяти; операции приостановлены до вашего решения.`,
+        );
+      } else {
+        setStorageWarning(null);
       }
+    }, 0);
+    return () => window.clearTimeout(saveTimer);
+  }, [portals, persistenceMode]);
 
-      const nextPortal = applyPortalAction(portal, action, {
-        confirmClose,
-      });
+  const activePortals = useMemo(
+    () => portals.filter((portal) => portal.currentStatus !== 'closed'),
+    [portals],
+  );
+  const archivedPortals = useMemo(
+    () => portals.filter((portal) => portal.currentStatus === 'closed'),
+    [portals],
+  );
+  const selectedPortal =
+    activePortals.find((portal) => portal.id === selectedId) ??
+    activePortals[0] ??
+    null;
+  const selectedArchive =
+    archivedPortals.find((portal) => portal.id === archiveSelectedId) ??
+    archivedPortals[0] ??
+    null;
+  const selectedEvaluation = selectedPortal ? evaluatePortal(selectedPortal, now) : null;
+  const stabilizationPreview =
+    selectedPortal?.pendingOperation?.kind === 'stabilize'
+      ? getStabilizationPreview(
+          selectedPortal,
+          now,
+          Math.max(0, Date.parse(selectedPortal.pendingOperation.completesAt) - now),
+        )
+      : null;
+  const summary = useMemo(
+    () => summarizePortals(portals, now),
+    [portals, now],
+  );
+  const unreviewedIncidents = summary.attentionPortals.filter(
+    (portal) =>
+      portal.currentStatus === 'closed' &&
+      (portal.lostOccupants ?? 0) > 0 &&
+      !portal.incidentReviewedAt,
+  );
+  const operationalAttentionPortals = summary.attentionPortals.filter(
+    (portal) => !unreviewedIncidents.includes(portal),
+  );
+  const sortedPortals = useMemo(
+    () =>
+      [...activePortals].sort(
+        (left, right) =>
+          evaluatePortal(right, now).riskScore - evaluatePortal(left, now).riskScore,
+      ),
+    [activePortals, now],
+  );
+  const allEvents = useMemo(
+    () =>
+      portals
+        .flatMap((portal) =>
+          portal.eventLog.map((event) => ({ ...event, portalName: portal.name })),
+        )
+        .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp)),
+    [portals],
+  );
+  const isReadOnly =
+    persistenceMode === 'blocked_read' || persistenceMode === 'blocked_write';
 
-      setPortals((current) => current.map((item) => (item.id === portal.id ? nextPortal : item)));
-      setSelectedId(nextPortal.id);
-      setNotice(`${actionLabels[action]} completed for ${portal.name}.`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'An unknown error occurred.';
-      setNotice(message);
+  const persist = (nextPortals: Portal[]) => {
+    setPortals(nextPortals);
+  };
+
+  const openIncidentArchive = (portal: Portal) => {
+    setArchiveSelectedId(portal.id);
+    setScreen('archive');
+    if (!portal.incidentReviewedAt) {
+      persist(
+        portals.map((item) =>
+          item.id === portal.id
+            ? { ...item, incidentReviewedAt: new Date().toISOString() }
+            : item,
+        ),
+      );
     }
   };
 
-  if (!selectedPortal && portals.length === 0) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-6 text-slate-200">
-        <div className="max-w-xl rounded-2xl border border-slate-800 bg-slate-900/80 p-8 shadow-2xl shadow-slate-950/30">
-          <p className="text-sm font-semibold uppercase tracking-[0.24em] text-cyan-300">Portal monitor</p>
-          <h1 className="mt-4 text-3xl font-semibold">No active portal records</h1>
-          <p className="mt-3 text-slate-300">
-            The archive is empty. Add an operational portal entry or reload the last saved dataset to resume monitoring.
-          </p>
-        </div>
-      </div>
+  const updatePortal = (
+    portal: Portal,
+    action: PortalAction,
+    occupantCount?: number,
+    confirmedClose = false,
+  ) => {
+    if (isReadOnly) {
+      setNotice('Операции приостановлены: восстановите хранилище или явно выберите работу без сохранения.');
+      return;
+    }
+    if (action === 'close' && portal.occupants > 0 && !confirmedClose) {
+      setCloseConfirmation({
+        portalId: portal.id,
+        name: portal.name,
+        occupants: portal.occupants,
+      });
+      return;
+    }
+    try {
+      const updated = applyPortalAction(portal, action, {
+        confirmClose: confirmedClose,
+        occupantCount,
+      });
+      persist(portals.map((item) => (item.id === portal.id ? updated : item)));
+      if (action === 'close') {
+        setCloseConfirmation(null);
+      }
+      if (action === 'send_observer') {
+        setNotice('Наблюдатель вошёл в портал на 10 минут; его учитывают среди находящихся внутри.');
+        return;
+      }
+      if (action === 'record_occupant_exit') {
+        setOccupantAdjustment(null);
+        setNotice(`Зафиксирован фактический выход ${occupantCount} человек/существ; внутри осталось ${updated.occupants}.`);
+        return;
+      }
+      if (action === 'record_occupant_entry') {
+        setOccupantAdjustment(null);
+        setNotice(`Зафиксирован фактический вход ${occupantCount} человек/существ; внутри теперь ${updated.occupants}.`);
+        return;
+      }
+      if (action === 'mark_under_review') {
+        setNotice(
+          updated.underQuestion
+            ? `Портал «${portal.name}» помечен «под вопросом».`
+            : `Отметка «под вопросом» для портала «${portal.name}» снята.`,
+        );
+        return;
+      }
+      const duration = OPERATION_DURATIONS_MS[
+        action === 'stabilize' ? 'stabilize' : action === 'close' ? 'close' : 'review'
+      ];
+      setNotice(
+        `${actionLabels[action]}: операция началась и займёт ${Math.round(duration / 60_000)} мин. Её можно отменить до завершения.`,
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Неизвестная ошибка операции.';
+      const blocked = recordBlockedAction(portal, action, reason);
+      persist(portals.map((item) => (item.id === portal.id ? blocked : item)));
+      setNotice(`Действие отклонено: ${reason}. Попытка записана в журнал.`);
+    }
+  };
+
+  const cancelOperation = (portal: Portal) => {
+    if (isReadOnly) {
+      setNotice('Операции приостановлены до восстановления хранилища или выбора режима без сохранения.');
+      return;
+    }
+    try {
+      const updated = cancelPortalOperation(portal);
+      persist(portals.map((item) => (item.id === portal.id ? updated : item)));
+      if (updated.currentStatus === 'closed') {
+        setNotice('Операцию отменить не удалось: портал уже схлопнулся и закрыт.');
+      } else if (updated.eventLog[0]?.action !== 'cancel_operation') {
+        setNotice('Операция уже завершилась; её результат сохранён.');
+      } else {
+        setNotice('Операция отменена. Если портал уже начал схлопываться, таймер схлопывания продолжится.');
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Не удалось отменить операцию.');
+    }
+  };
+
+  const submitOccupantAdjustment = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!occupantAdjustment || !selectedPortal || occupantAdjustment.portalId !== selectedPortal.id) {
+      return;
+    }
+    updatePortal(selectedPortal, occupantAdjustment.action, Number(occupantAdjustment.count));
+  };
+
+  const handleCreatePortal = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (isReadOnly) {
+      setNotice('Создание приостановлено до восстановления хранилища или выбора режима без сохранения.');
+      return;
+    }
+    try {
+      const portal = createPortal(draft);
+      persist([...portals, portal]);
+      setSelectedId(portal.id);
+      setScreen('overview');
+      setDraft(emptyDraft);
+      setShowCreateForm(false);
+      setNotice(`Портал «${portal.name}» добавлен; операция внесена в журнал.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Не удалось создать запись портала.');
+    }
+  };
+
+  const retryStorageRead = () => {
+    const result = loadPortals(INITIAL_PORTALS);
+    if (result.status === 'error') {
+      setStorageWarning(result.warning);
+      return;
+    }
+    setPortals(result.portals);
+    setSelectedId(result.portals[0]?.id ?? null);
+    setPersistenceMode('persistent');
+    setStorageWarning(null);
+    setNotice('Хранилище перечитано; загружено последнее сохранённое состояние.');
+  };
+
+  const retryPendingWrite = () => {
+    const result = savePortals(portals);
+    if (!result.ok) {
+      setStorageWarning(`${result.error} Изменения остаются в памяти.`);
+      return;
+    }
+    setPersistenceMode('persistent');
+    setStorageWarning(null);
+    setNotice('Изменения сохранены.');
+  };
+
+  const useMemoryOnly = () => {
+    setPersistenceMode('memory_only');
+    setStorageWarning(
+      'Работа без сохранения: содержимое localStorage не меняется, а новые изменения будут потеряны после перезагрузки.',
     );
-  }
+    setNotice('Включён режим работы без сохранения.');
+  };
 
-  const selectedEvaluation = selectedPortal ? evaluatePortal(selectedPortal) : null;
-
-  const actionConfig = selectedPortal
+  const actionConfig = selectedPortal && selectedEvaluation
     ? [
-        { action: 'stabilize' as const, label: 'Stabilize', disabled: selectedPortal.currentStatus === 'closed' },
-        { action: 'close' as const, label: 'Close', disabled: false },
-        { action: 'send_observer' as const, label: 'Send observer', disabled: selectedPortal.currentStatus === 'closed' || (selectedEvaluation?.riskLevel ?? 'low') === 'critical' },
-        { action: 'mark_under_review' as const, label: 'Mark under review', disabled: selectedPortal.currentStatus === 'closed' },
+        {
+          action: 'stabilize' as const,
+          disabled:
+            isReadOnly ||
+            selectedPortal.currentStatus === 'closed' ||
+            selectedPortal.currentStatus === 'collapsing' ||
+            selectedPortal.stability <= 0 ||
+            getEnergyAt(selectedPortal, now) <= 0 ||
+            Boolean(selectedPortal.pendingOperation),
+        },
+        {
+          action: 'close' as const,
+          disabled:
+            isReadOnly ||
+            selectedPortal.currentStatus === 'closed' ||
+            selectedPortal.currentStatus === 'collapsing' ||
+            Boolean(selectedPortal.pendingOperation),
+        },
+        {
+          action: 'send_observer' as const,
+          disabled:
+            isReadOnly ||
+            selectedPortal.currentStatus === 'closed' ||
+            selectedPortal.currentStatus === 'collapsing' ||
+            Boolean(selectedPortal.pendingOperation),
+        },
+        {
+          action: 'mark_under_review' as const,
+          disabled:
+            isReadOnly ||
+            selectedPortal.currentStatus === 'closed' ||
+            Boolean(selectedPortal.pendingOperation),
+        },
       ]
     : [];
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-        <header className="mb-8 rounded-3xl border border-slate-800 bg-slate-900/80 p-6 shadow-2xl shadow-slate-950/30">
-          <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
+        <header className="mb-6 rounded-3xl border border-slate-800 bg-slate-900/80 p-6">
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-end xl:justify-between">
             <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.24em] text-cyan-300">Laboratory portal monitor</p>
-              <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">Portal security overview</h1>
+              <p className="text-sm font-semibold uppercase tracking-[0.24em] text-cyan-300">
+                Монитор лаборатории
+              </p>
+              <h1 className="mt-3 text-3xl font-semibold tracking-tight text-white">
+                Безопасность порталов
+              </h1>
             </div>
-            <div className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-200">
-              Last sync: {selectedPortal ? formatTimestamp(selectedPortal.lastUpdated) : '—'}
-            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setDraft(emptyDraft);
+                setShowCreateForm(true);
+              }}
+              disabled={isReadOnly}
+              className="rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Добавить портал
+            </button>
           </div>
 
-          <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            {[
-              { label: 'Open portals', value: summary.openPortals, tone: 'text-cyan-300' },
-              { label: 'Critical risk', value: summary.criticalRisk, tone: 'text-rose-300' },
-              { label: 'Closed portals', value: summary.closedPortals, tone: 'text-violet-300' },
-              { label: 'Require attention', value: summary.attentionPortals, tone: 'text-amber-300' },
-            ].map((item) => (
-              <div key={item.label} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-400">{item.label}</p>
-                <p className={`mt-3 text-3xl font-bold ${item.tone}`}>{item.value}</p>
-              </div>
-            ))}
-          </div>
-
-          {storageWarning ? (
-            <div className="mt-6 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-              {storageWarning}
+          {storageWarning && (
+            <div
+              role="alert"
+              className="mt-5 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
+            >
+              <p>{storageWarning}</p>
+              {persistenceMode === 'blocked_read' && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={retryStorageRead} className="rounded-lg border border-amber-300/40 px-3 py-1.5 font-medium">
+                    Повторить чтение
+                  </button>
+                  <button type="button" onClick={useMemoryOnly} className="rounded-lg border border-amber-300/40 px-3 py-1.5 font-medium">
+                    Продолжить без сохранения
+                  </button>
+                </div>
+              )}
+              {persistenceMode === 'blocked_write' && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={retryPendingWrite} className="rounded-lg border border-amber-300/40 px-3 py-1.5 font-medium">
+                    Повторить сохранение
+                  </button>
+                  <button type="button" onClick={useMemoryOnly} className="rounded-lg border border-amber-300/40 px-3 py-1.5 font-medium">
+                    Продолжить без сохранения
+                  </button>
+                </div>
+              )}
             </div>
-          ) : null}
-
-          {notice ? (
-            <div className="mt-6 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
+          )}
+          {notice && (
+            <p role="status" className="mt-4 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
               {notice}
-            </div>
-          ) : null}
+            </p>
+          )}
+          <nav aria-label="Разделы" className="mt-6 flex flex-wrap gap-2 border-t border-slate-800 pt-4">
+            {([
+              ['overview', 'Обзор'],
+              ['archive', `Архив (${archivedPortals.length})`],
+              ['journal', 'Журнал событий'],
+              ['worklog', 'AI Worklog'],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-current={screen === value ? 'page' : undefined}
+                onClick={() => setScreen(value)}
+                className={`rounded-xl px-4 py-2 text-sm font-medium ${screen === value ? 'bg-slate-700 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
         </header>
 
-        <main className="grid gap-6 xl:grid-cols-[1.2fr_2fr]">
-          <aside className="rounded-3xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg shadow-slate-950/20">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold text-white">Portal list</h2>
-              <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-xs uppercase tracking-[0.18em] text-slate-300">
-                {portals.length} total
-              </span>
-            </div>
-
-            <div className="space-y-3">
-              {portals.map((portal) => {
-                const evaluation = evaluatePortal(portal);
-
-                return (
-                  <button
-                    key={portal.id}
-                    type="button"
-                    onClick={() => setSelectedId(portal.id)}
-                    className={`w-full rounded-2xl border p-4 text-left transition hover:border-cyan-500/60 hover:bg-slate-800/80 ${selectedPortal?.id === portal.id ? 'border-cyan-500/70 bg-slate-800/90' : 'border-slate-800 bg-slate-950/50'}`}
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <p className="text-lg font-semibold text-white">{portal.name}</p>
-                        <p className="text-sm text-slate-400">{portal.destination}</p>
-                      </div>
-                      <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${riskStyles[evaluation.riskLevel]}`}>
-                        {evaluation.riskLevel}
-                      </span>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-3 gap-3 text-sm text-slate-300">
-                      <div>
-                        <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Risk</p>
-                        <p className="mt-1 font-semibold text-white">{evaluation.riskScore}</p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Stability</p>
-                        <p className="mt-1 font-semibold text-white">{portal.stability}%</p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Window</p>
-                        <p className="mt-1 font-semibold text-white">{portal.timeToCollapseMinutes}m</p>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </aside>
-
-          {selectedPortal && selectedEvaluation ? (
-            <section className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg shadow-slate-950/20">
-              <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.22em] text-slate-400">Selected portal</p>
-                  <h2 className="mt-2 text-3xl font-semibold text-white">{selectedPortal.name}</h2>
-                  <p className="mt-2 text-slate-300">Destination: {selectedPortal.destination}</p>
+        {screen === 'overview' && (
+          <>
+            <section aria-label="Сводка" className="mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+              {[
+                { label: 'Открытые порталы', value: summary.openPortals, color: 'text-cyan-300' },
+                { label: 'Критический риск', value: summary.criticalRisk, color: 'text-rose-300' },
+                { label: 'Закрытые порталы', value: summary.closedPortals, color: 'text-violet-300' },
+                { label: 'Требуют внимания', value: summary.attentionPortals.length, color: 'text-amber-300' },
+              ].map((item) => (
+                <div key={item.label} className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
+                  <p className="text-xs uppercase tracking-[0.16em] text-slate-400">{item.label}</p>
+                  <p className={`mt-2 text-3xl font-bold ${item.color}`}>{item.value}</p>
                 </div>
+              ))}
+            </section>
 
-                <div className="flex flex-wrap gap-2">
-                  <span className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-sm text-slate-200">
-                    {selectedPortal.currentStatus === 'open' ? 'Open' : selectedPortal.currentStatus === 'closed' ? 'Closed' : 'Under review'}
-                  </span>
-                  <span className={`rounded-full px-3 py-1 text-sm font-medium ${riskStyles[selectedEvaluation.riskLevel]}`}>
-                    {selectedEvaluation.riskLevel.toUpperCase()} risk
+            {unreviewedIncidents.length > 0 && (
+              <section
+                aria-label="Очередь критических происшествий"
+                className="mb-6 rounded-2xl border border-rose-500/40 bg-slate-900/80 p-5"
+              >
+                <div className="flex flex-wrap items-baseline justify-between gap-3">
+                  <h2 className="text-lg font-semibold text-white">Критические происшествия</h2>
+                  <span className="text-sm text-rose-200">
+                    Требуют просмотра · {unreviewedIncidents.length}
                   </span>
                 </div>
-              </div>
-
-              <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Energy</p>
-                  <p className="mt-2 text-2xl font-bold text-white">{selectedPortal.energyLevel}%</p>
-                </div>
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Stability</p>
-                  <p className="mt-2 text-2xl font-bold text-white">{selectedPortal.stability}%</p>
-                </div>
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Collapse</p>
-                  <p className="mt-2 text-2xl font-bold text-white">{selectedPortal.timeToCollapseMinutes} min</p>
-                </div>
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Occupants</p>
-                  <p className="mt-2 text-2xl font-bold text-white">{selectedPortal.occupants}</p>
-                </div>
-              </div>
-
-              <div className="mt-6 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Pass status</p>
-                  <div className="mt-3 flex items-center gap-3">
-                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${selectedEvaluation.accessDecision === 'allowed' ? 'bg-emerald-500/15 text-emerald-300' : selectedEvaluation.accessDecision === 'requires_check' ? 'bg-amber-500/15 text-amber-300' : 'bg-rose-500/15 text-rose-300'}`}>
-                      {selectedEvaluation.accessDecision}
-                    </span>
-                    <span className="text-sm text-slate-300">
-                      {selectedEvaluation.accessDecision === 'allowed'
-                        ? 'Pass permitted.'
-                        : selectedEvaluation.accessDecision === 'requires_check'
-                          ? 'Requires manual verification before transit.'
-                          : 'Transit forbidden under current conditions.'}
-                    </span>
-                  </div>
-                  <p className="mt-4 text-sm leading-6 text-slate-300">{selectedPortal.notes}</p>
-                </div>
-
-                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Controls</p>
-                  <div className="mt-3 space-y-2">
-                    {actionConfig.map(({ action, label, disabled }) => (
+                <ol className="mt-4 grid gap-3 lg:grid-cols-3">
+                  {unreviewedIncidents.map((portal, index) => (
+                    <li key={portal.id}>
                       <button
-                        key={action}
                         type="button"
-                        onClick={() => handleAction(action, selectedPortal)}
-                        disabled={disabled}
-                        className="flex w-full items-center justify-between rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-left text-sm font-medium text-slate-100 transition hover:border-cyan-500/60 disabled:cursor-not-allowed disabled:opacity-40"
+                        onClick={() => openIncidentArchive(portal)}
+                        className="h-full w-full rounded-xl border border-rose-500/30 bg-slate-950/60 p-4 text-left hover:border-rose-400/70"
                       >
-                        <span>{label}</span>
-                        <span className="text-slate-400">→</span>
+                        <p className="text-xs uppercase tracking-[0.15em] text-slate-500">
+                          Происшествие {index + 1}
+                        </p>
+                        <p className="mt-2 font-semibold text-white">{portal.name}</p>
+                        <p className="mt-1 text-sm text-rose-200">
+                          Потеряны {portal.lostOccupants}; требуется внимание
+                        </p>
+                        <p className="mt-2 text-xs text-slate-400">
+                          {formatTimestamp(portal.closedAt ?? portal.lastUpdated)}
+                        </p>
+                        <p className="mt-2 text-sm text-cyan-200">
+                          Открыть архивную запись происшествия
+                        </p>
                       </button>
-                    ))}
-                  </div>
-                </div>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            )}
+
+            <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/80 p-5">
+              <div className="flex flex-wrap items-baseline justify-between gap-3">
+                <h2 className="text-lg font-semibold text-white">Очередь внимания</h2>
+                <span className="text-sm text-slate-400">Схлопывания, риск и время</span>
               </div>
+              {operationalAttentionPortals.length > 0 ? (
+                <ol className="mt-4 grid gap-3 lg:grid-cols-3">
+                  {operationalAttentionPortals.slice(0, 3).map((portal, index) => {
+                    const evaluation = evaluatePortal(portal, now);
+                    return (
+                      <li key={portal.id}>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedId(portal.id)}
+                          className="h-full w-full rounded-xl border border-slate-700 bg-slate-950/60 p-4 text-left hover:border-cyan-500/60"
+                        >
+                          <p className="text-xs uppercase tracking-[0.15em] text-slate-500">Приоритет {index + 1}</p>
+                          <p className="mt-2 font-semibold text-white">{portal.name}</p>
+                          <p className="mt-1 text-sm text-slate-300">
+                            `${riskLabels[evaluation.riskLevel]} риск · ${formatDuration(evaluation.remainingSeconds)} · внутри: ${portal.occupants}`
+                          </p>
+                          <p className="mt-2 text-sm leading-5 text-cyan-200">
+                            {getRecommendedAction(portal, now)}
+                          </p>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              ) : (
+                <p className="mt-3 text-sm text-slate-300">Активных порталов, требующих срочного внимания, нет.</p>
+              )}
+            </section>
 
-              <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <h3 className="text-lg font-semibold text-white">Event journal</h3>
-                  <span className="text-xs uppercase tracking-[0.18em] text-slate-500">{selectedPortal.eventLog.length} logs</span>
-                </div>
-
-                {selectedPortal.eventLog.length > 0 ? (
-                  <div className="space-y-3">
-                    {selectedPortal.eventLog.map((event) => (
-                      <div key={event.id} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                          <div className="flex items-center gap-2 text-sm">
-                            <span className="font-semibold text-cyan-300">{actionLabels[event.action]}</span>
-                            <span className="text-slate-500">·</span>
-                            <span className="text-slate-300">{event.result}</span>
-                          </div>
-                          <time className="text-xs text-slate-500">{formatTimestamp(event.timestamp)}</time>
-                        </div>
-                        <p className="mt-2 text-sm leading-6 text-slate-300">{event.description}</p>
-                      </div>
-                    ))}
+            {activePortals.length === 0 ? (
+              <section className="rounded-3xl border border-slate-800 bg-slate-900/80 p-8">
+                <h2 className="text-2xl font-semibold text-white">Нет активных порталов</h2>
+                <p className="mt-3 max-w-2xl text-slate-300">Закрытые записи хранятся в архиве. Добавьте новый портал или откройте архив.</p>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateForm(true)}
+                  disabled={isReadOnly}
+                  className="mt-5 rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 disabled:opacity-50"
+                >
+                  Добавить портал
+                </button>
+                {archivedPortals.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setScreen('archive')}
+                    className="ml-2 mt-5 rounded-xl border border-slate-700 px-4 py-2 font-semibold text-slate-200"
+                  >
+                    Открыть архив
+                  </button>
+                )}
+              </section>
+            ) : (
+              <main className="grid gap-6 xl:grid-cols-[0.95fr_2fr]">
+                <aside
+                  aria-label="Список порталов по убыванию риска"
+                  className="rounded-3xl border border-slate-800 bg-slate-900/80 p-4"
+                >
+                  <div className="mb-4 flex items-center justify-between">
+                    <h2 className="text-lg font-semibold text-white">Порталы</h2>
+                    <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-300">
+                      {activePortals.length}
+                    </span>
                   </div>
-                ) : (
-                  <p className="text-sm text-slate-400">No event history recorded for this portal.</p>
+                  <div className="space-y-3">
+                    {sortedPortals.map((portal) => {
+                      const evaluation = evaluatePortal(portal, now);
+                      return (
+                        <button
+                          key={portal.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedId(portal.id);
+                            setOccupantAdjustment(null);
+                          }}
+                          className={`w-full rounded-2xl border p-4 text-left transition hover:border-cyan-500/60 ${selectedPortal?.id === portal.id ? 'border-cyan-500/70 bg-slate-800/90' : 'border-slate-800 bg-slate-950/50'}`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="font-semibold text-white">{portal.name}</p>
+                              <p className="text-sm text-slate-400">{portal.destination}</p>
+                              <p className="mt-1 text-xs text-slate-400">
+                                {portal.currentStatus === 'open' ? 'Открыт' : portal.currentStatus === 'under_review' ? 'Проверяется' : 'Схлопывается'}
+                                {portal.underQuestion && ' · Под вопросом'}
+                              </p>
+                            </div>
+                            <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${riskStyles[evaluation.riskLevel]}`}>
+                              {riskLabels[evaluation.riskLevel]}
+                            </span>
+                          </div>
+                          <div className="mt-4 grid grid-cols-3 gap-2 text-sm text-slate-300">
+                            <span>Риск {evaluation.riskScore}</span>
+                            <span>Стаб. {portal.stability}%</span>
+                            <span>{formatDuration(evaluation.remainingSeconds)}</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </aside>
+
+                {selectedPortal && selectedEvaluation && (
+                  <section className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5">
+                    <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 lg:flex-row lg:items-start lg:justify-between">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Карточка портала</p>
+                        <h2 className="mt-2 text-2xl font-semibold text-white">{selectedPortal.name}</h2>
+                        <p className="mt-1 text-slate-300">Мир назначения: {selectedPortal.destination}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <span className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-sm text-slate-200">
+                          {selectedPortal.currentStatus === 'open' ? 'Открыт' : selectedPortal.currentStatus === 'under_review' ? 'Проверяется' : selectedPortal.currentStatus === 'collapsing' ? 'Схлопывается' : 'Закрыт'}
+                        </span>
+                        {selectedPortal.underQuestion && (
+                          <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-sm text-amber-200">
+                            Под вопросом
+                          </span>
+                        )}
+                        <span className={`rounded-full px-3 py-1 text-sm font-medium ${riskStyles[selectedEvaluation.riskLevel]}`}>
+                          {riskLabels[selectedEvaluation.riskLevel]} риск · {selectedEvaluation.riskScore}/100
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                      {[
+                        ['Запас энергии', `${Math.floor(getEnergyAt(selectedPortal, now))}%`],
+                        ['Стабильность', `${selectedPortal.stability}%`],
+                        [
+                          'До схлопывания',
+                          formatDuration(selectedEvaluation.remainingSeconds),
+                        ],
+                        ['Находятся внутри', String(selectedPortal.occupants)],
+                      ].map(([label, value]) => (
+                        <div key={label} className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                          <p className="text-xs uppercase tracking-[0.14em] text-slate-500">{label}</p>
+                          <p className="mt-2 text-xl font-bold text-white">{value}</p>
+                        </div>
+                      ))}
+                    </div>
+                    {selectedPortal.currentStatus !== 'closed' && (
+                      <p className="mt-3 text-xs text-slate-400">
+                        Расход сейчас: {getEnergyDrainRate(selectedPortal).toFixed(2)} п.п./мин
+                        {' '}· при снижении стабильности запас расходуется быстрее.
+                      </p>
+                    )}
+
+                    {selectedPortal.pendingOperation && (
+                      <div className="mt-5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="font-semibold text-cyan-100">
+                              {actionLabels[
+                                selectedPortal.pendingOperation.kind === 'review'
+                                  ? 'mark_under_review'
+                                  : selectedPortal.pendingOperation.kind === 'observer'
+                                    ? 'send_observer'
+                                    : selectedPortal.pendingOperation.kind
+                              ]}
+                              {' '}— выполняется
+                            </p>
+                            <p className="mt-1 text-sm text-cyan-100/80">
+                              До завершения: {formatDuration(Math.max(0, (Date.parse(selectedPortal.pendingOperation.completesAt) - now) / 1000))}
+                              {stabilizationPreview &&
+                                (stabilizationPreview.possible
+                                  ? ` · прогноз после: ${formatDuration(stabilizationPreview.minutesAfter * 60)}, энергия ${Math.floor(stabilizationPreview.energyAfter)}%, стабильность ${stabilizationPreview.stabilityAfter}%`
+                                  : ' · энергии не хватит, стабилизация будет прервана')}
+                              {selectedPortal.pendingOperation.kind === 'observer' && ' · наблюдатель учитывается внутри'}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => cancelOperation(selectedPortal)}
+                            disabled={isReadOnly}
+                            className="rounded-lg border border-cyan-200/40 px-3 py-2 text-sm font-medium text-cyan-100 hover:bg-cyan-500/10 disabled:opacity-50"
+                          >
+                            Отменить
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {selectedPortal.currentStatus === 'collapsing' && (
+                      <div role="alert" className="mt-5 rounded-xl border border-rose-500/50 bg-rose-500/10 p-4 text-rose-100">
+                        <p className="font-semibold">Портал схлопывается немедленно</p>
+                        <p className="mt-1 text-sm">
+                        Запас энергии исчерпан или стабильность достигла 0%. Дополнительной задержки до закрытия нет. Внутри: {selectedPortal.occupants}.
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="mt-5 grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+                      <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                        <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Допуск к проходу</p>
+                        <p className={`mt-2 font-semibold ${selectedEvaluation.accessDecision === 'allowed' ? 'text-emerald-300' : selectedEvaluation.accessDecision === 'requires_check' ? 'text-amber-300' : 'text-rose-300'}`}>
+                          {selectedEvaluation.accessDecision === 'allowed' ? 'Разрешён' : selectedEvaluation.accessDecision === 'requires_check' ? 'Требует проверки' : 'Запрещён'}
+                        </p>
+                        <p className="mt-3 text-xs uppercase tracking-[0.18em] text-slate-500">Рекомендация</p>
+                        <p className="mt-2 text-sm leading-6 text-slate-200">{getRecommendedAction(selectedPortal, now)}</p>
+                        <p className="mt-3 text-sm leading-6 text-slate-400">{selectedPortal.notes}</p>
+                        <p className="mt-3 border-t border-slate-800 pt-3 text-xs leading-5 text-slate-500">
+                          Риск учитывает энергию, нестабильность, время до схлопывания и число находящихся внутри.
+                        </p>
+                        <details className="mt-2 text-xs leading-5 text-slate-400">
+                          <summary className="cursor-pointer font-medium text-slate-300">Формула и вклад находящихся внутри</summary>
+                          <p className="mt-2">
+                            Балл 0–100: 30% истощения запаса энергии + 25% нестабильности + 20% срочности времени + 25% экспозиции.
+                            Энергетический вклад растёт при уменьшении остатка запаса; стабильность влияет на скорость расхода. Срочность растёт по мере уменьшения расчётного времени до схлопывания (калибровка — 180 минут).
+                          </p>
+                          <p className="mt-2">
+                            Экспозиция = min(100, число внутри × 10 / max(минут до схлопывания, 0,1)).
+                            Например, 10 внутри и 1 минута дают 25 баллов из 100 за экспозицию.
+                            Если внутри есть люди, осталось не более 2 минут и экспозиция ≥75, итоговый риск как минимум критический — 75.
+                          </p>
+                        </details>
+                      </div>
+
+                      <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                        <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Операции</p>
+                        <div className="mt-3 space-y-2">
+                          {actionConfig.map(({ action, disabled }) => (
+                            <button
+                              key={action}
+                              type="button"
+                              onClick={() => updatePortal(selectedPortal, action)}
+                              disabled={disabled}
+                              className="w-full rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-left text-sm font-medium text-slate-100 transition hover:border-cyan-500/60 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {action === 'mark_under_review' && selectedPortal.underQuestion
+                                ? 'Снять отметку «под вопросом»'
+                                : actionLabels[action]}
+                            </button>
+                          ))}
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOccupantAdjustment({
+                                  portalId: selectedPortal.id,
+                                  action: 'record_occupant_exit',
+                                  count: '1',
+                                })
+                              }
+                              disabled={
+                                isReadOnly ||
+                                selectedPortal.currentStatus === 'closed' ||
+                                selectedPortal.occupants <=
+                                  (selectedPortal.pendingOperation?.kind === 'observer' ? 1 : 0)
+                              }
+                              className="rounded-xl border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-left text-sm font-medium text-amber-100 transition hover:border-amber-400 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {actionLabels.record_occupant_exit}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOccupantAdjustment({
+                                  portalId: selectedPortal.id,
+                                  action: 'record_occupant_entry',
+                                  count: '1',
+                                })
+                              }
+                              disabled={
+                                isReadOnly ||
+                                selectedPortal.currentStatus !== 'open' ||
+                                selectedEvaluation.accessDecision !== 'allowed' ||
+                                Boolean(selectedPortal.pendingOperation)
+                              }
+                              className="rounded-xl border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 text-left text-sm font-medium text-cyan-100 transition hover:border-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {actionLabels.record_occupant_entry}
+                            </button>
+                          </div>
+                          {occupantAdjustment?.portalId === selectedPortal.id && (
+                            <form
+                              onSubmit={submitOccupantAdjustment}
+                              className="rounded-xl border border-slate-700 bg-slate-950/80 p-3"
+                            >
+                              <label
+                                htmlFor="occupant-adjustment-count"
+                                className="block text-sm font-medium text-slate-200"
+                              >
+                                Сколько {occupantAdjustment.action === 'record_occupant_entry' ? 'вошло' : 'вышло'}?
+                              </label>
+                              <div className="mt-2 flex gap-2">
+                                <input
+                                  id="occupant-adjustment-count"
+                                  type="number"
+                                  min="1"
+                                  max={
+                                    occupantAdjustment.action === 'record_occupant_exit'
+                                      ? selectedPortal.occupants -
+                                        (selectedPortal.pendingOperation?.kind === 'observer' ? 1 : 0)
+                                      : undefined
+                                  }
+                                  step="1"
+                                  required
+                                  value={occupantAdjustment.count}
+                                  onChange={(event) =>
+                                    setOccupantAdjustment({
+                                      ...occupantAdjustment,
+                                      count: event.target.value,
+                                    })
+                                  }
+                                  className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
+                                />
+                                <button
+                                  type="submit"
+                                  className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950"
+                                >
+                                  Зафиксировать
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setOccupantAdjustment(null)}
+                                  className="rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-200"
+                                >
+                                  Отмена
+                                </button>
+                              </div>
+                              <p className="mt-2 text-xs leading-5 text-slate-500">
+                                Указывайте только фактически состоявшийся проход. Обычный вход доступен только при допуске «разрешён»; если нужна проверка, сначала дождитесь возвращения наблюдателя.
+                              </p>
+                            </form>
+                          )}
+                          <p className="text-xs leading-5 text-slate-500">
+                            Изменение числа находящихся внутри сразу влияет на оценку риска; само перемещение приложение не моделирует.
+                          </p>
+                          <p className="text-xs leading-5 text-slate-500">
+                            При отметке «требует проверки» отправьте наблюдателя: это реальный 10-минутный визит внутрь, не осмотр снаружи. На время визита он добавляется к числу находящихся внутри; при возвращении вычитается.
+                          </p>
+                          <p className="text-xs leading-5 text-slate-500">
+                            После возвращения обычный проход может быть разрешён на 30 минут, только если риск остаётся низким/средним, стабильность не ниже 35%, а до схлопывания не менее 15 минут. Сам балл риска от наблюдения не уменьшается.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h3 className="font-semibold text-white">История портала</h3>
+                        <span className="text-xs text-slate-500">{selectedPortal.eventLog.length} событий</span>
+                      </div>
+                      <EventList events={selectedPortal.eventLog} />
+                    </div>
+                  </section>
+                )}
+              </main>
+            )}
+          </>
+        )}
+
+        {screen === 'archive' && (
+          <section className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5">
+            <div className="mb-5">
+              <h2 className="text-xl font-semibold text-white">Архив закрытых порталов</h2>
+              <p className="mt-1 text-sm text-slate-400">Исторические записи. Архив не обновляет таймеры и не меняет состояние порталов.</p>
+            </div>
+            {archivedPortals.length === 0 ? (
+              <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-5 text-sm text-slate-300">
+                Закрытых порталов пока нет.
+              </p>
+            ) : (
+              <div className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
+                <nav aria-label="Закрытые порталы" className="space-y-2">
+                  {archivedPortals.map((portal) => (
+                    <button
+                      key={portal.id}
+                      type="button"
+                      onClick={() => setArchiveSelectedId(portal.id)}
+                      aria-current={selectedArchive?.id === portal.id ? 'true' : undefined}
+                      className={`w-full rounded-xl border p-4 text-left ${selectedArchive?.id === portal.id ? 'border-cyan-500/60 bg-slate-800' : 'border-slate-800 bg-slate-950/50'}`}
+                    >
+                      <span className="block font-semibold text-white">{portal.name}</span>
+                      <span className="mt-1 block text-xs text-slate-400">Закрыт · {formatTimestamp(portal.closedAt ?? portal.lastUpdated)}</span>
+                      {(portal.lostOccupants ?? 0) > 0 && (
+                        <span className="mt-2 block text-sm font-medium text-rose-300">Происшествие · требуется внимание</span>
+                      )}
+                    </button>
+                  ))}
+                </nav>
+                {selectedArchive && (
+                  <article className="rounded-2xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="border-b border-slate-800 pb-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500">Историческая запись · портал закрыт</p>
+                      <h3 className="mt-2 text-2xl font-semibold text-white">{selectedArchive.name}</h3>
+                      <p className="mt-1 text-sm text-slate-400">ID: {selectedArchive.id} · Мир: {selectedArchive.destination}</p>
+                    </div>
+                    <dl className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <dt className="text-xs uppercase tracking-wider text-slate-500">Время закрытия</dt>
+                        <dd className="mt-1 text-sm text-slate-200">{formatTimestamp(selectedArchive.closedAt ?? selectedArchive.lastUpdated)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs uppercase tracking-wider text-slate-500">Причина</dt>
+                        <dd className="mt-1 text-sm text-slate-200">{closureReasonLabel(selectedArchive.closureReason)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs uppercase tracking-wider text-slate-500">Запас энергии на момент закрытия</dt>
+                        <dd className="mt-1 text-sm text-slate-200">{Math.floor(selectedArchive.energyLevel)}%</dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs uppercase tracking-wider text-slate-500">Стабильность на момент закрытия</dt>
+                        <dd className="mt-1 text-sm text-slate-200">{selectedArchive.stability}%</dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs uppercase tracking-wider text-slate-500">Остались по другую сторону</dt>
+                        <dd className="mt-1 text-sm text-slate-200">{selectedArchive.occupants}</dd>
+                      </div>
+                    </dl>
+                    {(selectedArchive.lostOccupants ?? 0) > 0 && (
+                      <div role="alert" className="mt-5 rounded-xl border border-rose-500/60 bg-rose-500/10 p-4">
+                        <p className="font-semibold text-rose-200">Происшествие требует внимания</p>
+                        <p className="mt-1 text-sm text-rose-100">Запись происшествия и число потерь сохранены в журнале событий портала.</p>
+                      </div>
+                    )}
+                    <p className="mt-4 text-sm leading-6 text-slate-300">{selectedArchive.notes}</p>
+                    <div className="mt-5 border-t border-slate-800 pt-4">
+                      <h4 className="mb-3 font-semibold text-white">История портала</h4>
+                      <EventList events={selectedArchive.eventLog} />
+                    </div>
+                  </article>
                 )}
               </div>
-            </section>
-          ) : null}
-        </main>
+            )}
+          </section>
+        )}
+
+        {screen === 'journal' && (
+          <section className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5">
+            <h2 className="text-xl font-semibold text-white">Журнал событий лаборатории</h2>
+            <p className="mt-1 text-sm text-slate-400">События всех порталов, последние — первыми.</p>
+            <div className="mt-5">
+              {allEvents.length > 0 ? (
+                <div className="space-y-3">
+                  {allEvents.map((event) => (
+                    <article key={`${event.portalId}:${event.id}`} className={`rounded-xl border bg-slate-950/60 p-4 ${event.result === 'critical' ? 'border-rose-500/60' : 'border-slate-800'}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className={`font-semibold ${event.result === 'critical' ? 'text-rose-200' : 'text-cyan-200'}`}>{actionLabels[event.action]} · {event.portalName}</p>
+                        <time className="text-xs text-slate-500">{formatTimestamp(event.timestamp)}</time>
+                      </div>
+                      <p className="mt-2 text-sm text-slate-300">{event.description}</p>
+                      <p className={`mt-2 text-xs ${event.result === 'blocked' || event.result === 'critical' ? 'text-rose-300' : event.result === 'warning' ? 'text-amber-300' : 'text-slate-400'}`}>
+                        {eventResultLabels[event.result]}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-5 text-sm text-slate-300">
+                  Событий пока нет. Новые операции будут записаны сюда.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
+        {screen === 'worklog' && <Worklog />}
       </div>
+
+      {showCreateForm && (
+        <div className="fixed inset-0 z-10 flex items-center justify-center overflow-y-auto bg-slate-950/90 p-4">
+          <form
+            aria-label="Новый портал"
+            onSubmit={handleCreatePortal}
+            className="my-auto w-full max-w-xl rounded-2xl border border-slate-700 bg-slate-900 p-6"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-semibold text-white">Новый портал</h2>
+                <p className="mt-1 text-sm text-slate-400">Запись попадёт в журнал наблюдений.</p>
+              </div>
+              <button type="button" onClick={() => setShowCreateForm(false)} className="text-sm text-slate-300 hover:text-white">
+                Отмена
+              </button>
+            </div>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <label className="text-sm text-slate-300">Название
+                <input required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+              </label>
+              <label className="text-sm text-slate-300">Мир назначения
+                <input required value={draft.destination} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+              </label>
+              <label className="text-sm text-slate-300">Энергия (%)
+                <input type="number" min="0" max="100" required value={draft.energyLevel} onChange={(event) => setDraft({ ...draft, energyLevel: Number(event.target.value) })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+              </label>
+              <label className="text-sm text-slate-300">Стабильность (%)
+                <input type="number" min="0" max="100" required value={draft.stability} onChange={(event) => setDraft({ ...draft, stability: Number(event.target.value) })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+              </label>
+              <label className="text-sm text-slate-300">Людей/существ внутри
+                <input type="number" min="0" step="1" required value={draft.occupants} onChange={(event) => setDraft({ ...draft, occupants: Number(event.target.value) })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+              </label>
+            </div>
+            <p className="mt-3 text-xs leading-5 text-slate-400">
+              Время до схлопывания рассчитывается автоматически из запаса энергии и стабильности. При текущих значениях прогноз: {formatDuration(
+                (draft.energyLevel / (2 - draft.stability / 100)) * 60,
+              )}; базовый расход — 1 процентный пункт запаса в минуту при стабильности 100%.
+            </p>
+            <button type="submit" disabled={isReadOnly} className="mt-5 rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
+              Создать запись
+            </button>
+          </form>
+        </div>
+      )}
+      {closeConfirmation && (
+        <div
+          className="fixed inset-0 z-20 flex items-center justify-center bg-slate-950/85 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setCloseConfirmation(null);
+              setNotice('Закрытие отменено; портал не изменён.');
+            }
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-confirmation-title"
+            className="w-full max-w-lg rounded-2xl border border-amber-500/40 bg-slate-900 p-6"
+          >
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-300">
+              Подтверждение закрытия
+            </p>
+            <h2 id="close-confirmation-title" className="mt-2 text-xl font-semibold text-white">
+              Закрыть «{closeConfirmation.name}»?
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-slate-300">
+              Внутри остаются {closeConfirmation.occupants} человек/существ. Закрытие займёт одну минуту. Подтвердите только если последствия для них учтены.
+            </p>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setCloseConfirmation(null);
+                  setNotice('Закрытие отменено; портал не изменён.');
+                }}
+                className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800"
+              >
+                Не закрывать
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const portal = portals.find((item) => item.id === closeConfirmation.portalId);
+                  setCloseConfirmation(null);
+                  if (portal) {
+                    updatePortal(portal, 'close', undefined, true);
+                  } else {
+                    setNotice('Не удалось найти портал для закрытия.');
+                  }
+                }}
+                className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-300"
+              >
+                Подтвердить закрытие
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
+  );
+}
+
+function EventList({ events }: { events: PortalEvent[] }) {
+  if (events.length === 0) {
+    return <p className="text-sm text-slate-400">История этого портала пока пуста.</p>;
+  }
+  return (
+    <div className="space-y-3">
+      {events.map((event) => (
+        <article key={event.id} className={`rounded-xl border bg-slate-900/70 p-3 ${event.result === 'critical' ? 'border-rose-500/60' : 'border-slate-800'}`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className={`font-semibold ${event.result === 'critical' ? 'text-rose-300' : 'text-cyan-300'}`}>{actionLabels[event.action]}</span>
+              <span className="text-slate-500">·</span>
+              <span className={event.result === 'critical' ? 'font-semibold text-rose-300' : 'text-slate-300'}>{eventResultLabels[event.result]}</span>
+            </div>
+            <time className="text-xs text-slate-500">{formatTimestamp(event.timestamp)}</time>
+          </div>
+          <p className="mt-2 text-sm leading-6 text-slate-300">{event.description}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function Worklog() {
+  return (
+    <section className="space-y-5 rounded-3xl border border-slate-800 bg-slate-900/80 p-5">
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Прозрачность разработки</p>
+        <h2 className="mt-2 text-2xl font-semibold text-white">AI Worklog</h2>
+        <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
+          Запись составлена по доступной истории проекта. Неизмеренные значения не оцениваются на глаз.
+        </p>
+      </div>
+      <dl className="grid gap-3 sm:grid-cols-3">
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+          <dt className="text-xs uppercase tracking-wider text-slate-500">AI-инструмент</dt>
+          <dd className="mt-2 text-sm text-slate-200">AI assistant через Copilot SDK в VS Code</dd>
+        </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+          <dt className="text-xs uppercase tracking-wider text-slate-500">Время разработки</dt>
+          <dd className="mt-2 text-sm text-slate-200">Активное время не фиксировалось; надёжно восстановить нельзя.</dd>
+        </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+          <dt className="text-xs uppercase tracking-wider text-slate-500">Токены</dt>
+          <dd className="mt-2 text-sm text-slate-200">Статистика расхода недоступна; токены не подсчитаны.</dd>
+        </div>
+      </dl>
+      <div>
+        <h3 className="font-semibold text-white">Этапы и вклад</h3>
+        <ol className="mt-3 space-y-3">
+          <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <h4 className="font-medium text-white">Требования и архитектура</h4>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> описал модель порталов и критерии проекта. <strong>AI:</strong> выбрал React/TypeScript/Vite, отделил правила от UI и хранения.</p>
+            <p className="mt-2 text-xs text-slate-500">Запрос: панель смотрителя с объяснимым риском, ограничениями действий, журналом и локальным сохранением.</p>
+          </li>
+          <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <h4 className="font-medium text-white">Риск, интерфейс и проверки</h4>
+            <p className="mt-1 text-sm text-slate-300"><strong>AI:</strong> реализовал модель риска, допуск, операции, журнал и тесты. <strong>Пользователь:</strong> запросил полный аудит требований и дальнейшие улучшения поведения.</p>
+            <p className="mt-2 text-xs text-slate-500">Запрос: проверить края, документацию и соответствие обоим техническим заданиям.</p>
+          </li>
+          <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <h4 className="font-medium text-white">Асинхронные операции и схлопывание</h4>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> потребовал отменяемые операции, реальное схлопывание, больше порталов и связь риска со временем и находящимися внутри. <strong>AI:</strong> добавил задержки операций и проверку пороговых условий схлопывания.</p>
+            <p className="mt-2 text-xs text-slate-500">Игровое допущение: базовый расход — 1 процентный пункт запаса в минуту при стабильности 100%; при стабильности 0% расход удваивается, но сам порог 0% вызывает немедленное схлопывание. Стабилизация длится 2 минуты, тратит 12 процентных пунктов запаса и повышает стабильность на 20 пунктов. Каждый вход и выход снижает стабильность на 1 пункт. Наблюдатель находится внутри 10 минут; закрытие — 1 минуту; после исчерпания энергии портал закрывается сразу, без дополнительной задержки.</p>
+          </li>
+          <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <h4 className="font-medium text-white">Энергетическая модель</h4>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> уточнил смысл энергии как расходуемого запаса и стабильности как фактора скорости его расхода; проходы должны снижать стабильность, а стабилизация — тратить энергию. <strong>AI:</strong> заменил независимый ETA на расчёт от запаса и скорости расхода, добавил миграцию старых записей, прогноз стабилизации и регрессионные тесты.</p>
+            <p className="mt-2 text-xs text-slate-500">Запрос: «энергия тратится вместе с отсчётом», стабильность меняется при проходах, а стабилизация расходует энергию и повышает стабильность без отдельного ускорения/замедления таймера.</p>
+          </li>
+          <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <h4 className="font-medium text-white">Происшествия при схлопывании</h4>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> потребовал не откладывать схлопывание, фиксировать оставшихся внутри как потерянных и исключить повторный учёт. <strong>AI:</strong> добавил критическое событие, счётчик потерь, очередь внимания, миграцию старых записей и тесты состояния/сводки.</p>
+            <p className="mt-2 text-xs text-slate-500">Запрос: любое схлопывание с людьми внутри должно сразу закрыть портал и создать заметное происшествие с временем и числом потерь.</p>
+          </li>
+        </ol>
+      </div>
+      <div className="grid gap-5 lg:grid-cols-2">
+        <div>
+          <h3 className="font-semibold text-white">Технические решения</h3>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
+            <li>Риск — эвристический балл, а не калиброванная вероятность происшествия.</li>
+            <li>В формуле отдельно учитываются энергия, стабильность, время до схлопывания и экспозиция людей.</li>
+            <li>Операции работают по таймеру, переживают перезагрузку и могут быть отменены до завершения.</li>
+            <li>Нулевой запас энергии или стабильность немедленно закрывают портал; отдельного окна ожидания после ETA нет.</li>
+            <li>Энергия — расходуемый запас: базовый расход 1 процентный пункт в минуту при стабильности 100%; при нулевой стабильности расход удваивается.</li>
+            <li>Стабилизация длится 2 минуты, расходует 12 пунктов энергии и повышает стабильность на 20 пунктов; новый прогноз схлопывания сразу виден в карточке.</li>
+            <li>Каждый вошедший и вышедший человек снижает стабильность на 1 пункт; выход вручную учитывает только фактически состоявшийся проход.</li>
+            <li>Визит наблюдателя длится 10 минут; наблюдатель учитывается среди находящихся внутри и возвращается по завершении или отмене.</li>
+            <li>Выход и вход учитываются только по явному подтверждению смотрителя; приложение не выдаёт эти записи за симуляцию перемещения.</li>
+          </ul>
+        </div>
+        <div>
+          <h3 className="font-semibold text-white">Ошибки AI и доработка</h3>
+          <p className="mt-2 text-sm leading-6 text-slate-300">
+          Ранние версии мгновенно выполняли операции, некорректно замедляли таймер при стабилизации и считали отсутствие времени до закрытого портала как срочное схлопывание. По запросу пользователя исходная модель таймера заменена на расход запаса энергии: стабильность влияет на расход, проходы снижают стабильность, стабилизация тратит энергию и улучшает стабильность. Миграция старых записей сохраняет исходный ETA через калибровку скорости. Аудит выявил и исправил указанные проблемы; бизнес-правила и операции покрыты тестами.
+          </p>
+        </div>
+      </div>
+      <div>
+        <h3 className="font-semibold text-white">Проверка и ограничения</h3>
+        <p className="mt-2 text-sm leading-6 text-slate-300">
+          Перед сдачей запускаются `npm test`, `npm run build` и `npm run lint`. Ручная браузерная проверка указывается отдельно, только если её действительно выполнили. Для реального продукта нужны серверный аудит, подтверждённая калибровка риска, моделирование и контроль эвакуации, а также надёжные источники показаний.
+        </p>
+      </div>
+    </section>
   );
 }
 
