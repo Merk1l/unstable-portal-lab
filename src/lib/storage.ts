@@ -74,7 +74,7 @@ function isPortalClosureReason(value: unknown): value is PortalClosureReason {
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
-  return isFiniteNumber(value) && Number.isInteger(value) && value >= 0;
+  return isFiniteNumber(value) && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isPortalEnvelope(

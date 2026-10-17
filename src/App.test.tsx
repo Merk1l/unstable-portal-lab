@@ -60,8 +60,8 @@ describe('панель управления', () => {
     fireEvent.click(screen.getByRole('button', { name: 'AI Worklog' }));
 
     expect(screen.getByRole('heading', { name: 'AI Worklog' })).toBeInTheDocument();
-    expect(screen.getByText(/Активное время не фиксировалось/)).toBeInTheDocument();
-    expect(screen.getByText(/токены не подсчитаны/)).toBeInTheDocument();
+    expect(screen.getByText(/Общее время разработки надёжно не фиксировалось/)).toBeInTheDocument();
+    expect(screen.getByText(/Количество токенов не измерялось/)).toBeInTheDocument();
   });
 
   it('отклоняет критическую отправку наблюдателя и добавляет отказ в журнал', async () => {

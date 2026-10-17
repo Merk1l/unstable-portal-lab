@@ -149,6 +149,9 @@ export function getRemainingCollapseSeconds(portal: Portal, now = Date.now()): n
 }
 
 export function calculateRisk(portal: Portal, now = Date.now()): number {
+  if (portal.currentStatus === 'closed') {
+    return 0;
+  }
   const remainingSeconds = getRemainingCollapseSeconds(portal, now);
   const remainingMinutes =
     remainingSeconds === null ? portal.timeToCollapseMinutes : remainingSeconds / 60;
@@ -441,7 +444,7 @@ export function createPortal(draft: PortalDraft): Portal {
     !Number.isFinite(draft.stability) ||
     draft.stability < 0 ||
     draft.stability > 100 ||
-    !Number.isInteger(draft.occupants) ||
+    !Number.isSafeInteger(draft.occupants) ||
     draft.occupants < 0
   ) {
     throw new Error('Проверьте значения: проценты — от 0 до 100, число находящихся внутри — неотрицательное целое.');
@@ -578,7 +581,7 @@ export function applyPortalAction(
     if (portal.occupants > 0 && !options.confirmClose) {
       throw new Error('Внутри остаются существа или люди. Для закрытия требуется явное подтверждение.');
     }
-    const now = new Date().toISOString();
+    const now = new Date(options.now ?? Date.now()).toISOString();
     return startOperation(portal, 'close', portal.currentStatus, now);
   }
   if (action === 'send_observer') {
@@ -628,7 +631,7 @@ export function applyPortalAction(
       throw new Error('Портал уже достиг порога схлопывания; проход через него невозможен.');
     }
     const count = options.occupantCount;
-    if (!Number.isInteger(count) || !count || count < 1) {
+    if (!Number.isSafeInteger(count) || !count || count < 1) {
       throw new Error('Укажите положительное целое число вышедших.');
     }
     const countedObserver = portal.pendingOperation?.kind === 'observer' ? 1 : 0;
@@ -678,8 +681,11 @@ export function applyPortalAction(
       throw new Error('Вход можно зафиксировать только в открытый портал без выполняющейся операции.');
     }
     const count = options.occupantCount;
-    if (!Number.isInteger(count) || !count || count < 1) {
+    if (!Number.isSafeInteger(count) || !count || count < 1) {
       throw new Error('Укажите положительное целое число вошедших.');
+    }
+    if (count > Number.MAX_SAFE_INTEGER - portal.occupants) {
+      throw new Error('Количество находящихся внутри превышает безопасный диапазон.');
     }
     if (getAccessDecision(portal, options.now ?? Date.now()) !== 'allowed') {
       throw new Error('Вход запрещён: текущие условия портала не допускают проход.');
@@ -723,7 +729,7 @@ export function applyPortalAction(
     if (portal.currentStatus === 'closed' || portal.currentStatus === 'collapsing') {
       throw new Error('Закрытый портал или портал, который схлопывается, нельзя пометить «под вопросом».');
     }
-    const now = new Date().toISOString();
+    const now = new Date(options.now ?? Date.now()).toISOString();
     const underQuestion = !portal.underQuestion;
     return withEvent(
       { ...portal, underQuestion },

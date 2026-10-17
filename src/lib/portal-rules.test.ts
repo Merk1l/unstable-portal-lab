@@ -135,6 +135,23 @@ describe('модель риска и допуска', () => {
     expect(summary.attentionPortals[0].id).toBe(collapsing.id);
     expect(summary.criticalRisk).toBe(1);
   });
+
+  it('не считает закрытый портал активным риском и не выдаёт для него ETA', () => {
+    const closed = {
+      ...basePortal,
+      currentStatus: 'closed' as const,
+      energyLevel: 0,
+      stability: 0,
+      timeToCollapseMinutes: 0,
+    };
+    const evaluation = evaluatePortal(closed, now);
+
+    expect(calculateRisk(closed, now)).toBe(0);
+    expect(evaluation.riskScore).toBe(0);
+    expect(evaluation.riskLevel).toBe('low');
+    expect(evaluation.remainingSeconds).toBeNull();
+    expect(evaluation.accessDecision).toBe('forbidden');
+  });
 });
 
 describe('асинхронные операции', () => {
@@ -165,6 +182,32 @@ describe('асинхронные операции', () => {
     expect(getCollapseAt(completed)! - Date.parse(completed.energyUpdatedAt!)).toBeCloseTo(
       (65 / 1.3) * 60_000,
     );
+  });
+
+  it('восстанавливает незавершённую операцию и учитывает время после загрузки сохранения', () => {
+    const portal: Portal = {
+      ...basePortal,
+      energyLevel: 80,
+      stability: 50,
+      occupants: 0,
+      energyUpdatedAt: new Date(now).toISOString(),
+      baseEnergyDrainPerMinute: 1,
+    };
+    const started = applyPortalAction(portal, 'stabilize', { now });
+    expect(savePortals([started]).ok).toBe(true);
+    const restored = loadPortals([]).portals[0];
+    const halfway = advancePortals([restored], now + 60_000)[0];
+
+    expect(halfway.pendingOperation?.kind).toBe('stabilize');
+    expect(getEnergyAt(halfway, now + 60_000)).toBeCloseTo(78.5);
+
+    const completed = advancePortals(
+      [halfway],
+      Date.parse(started.pendingOperation!.completesAt),
+    )[0];
+    expect(completed.pendingOperation).toBeNull();
+    expect(completed.energyLevel).toBeCloseTo(65);
+    expect(completed.stability).toBe(70);
   });
 
   it('снижает скорость расхода энергии при повышении стабильности', () => {
@@ -220,9 +263,13 @@ describe('асинхронные операции', () => {
   });
 
   it('закрывает портал через минуту и позволяет отменить закрытие', () => {
-    const started = applyPortalAction(basePortal, 'close', { confirmClose: true });
+    const started = applyPortalAction(basePortal, 'close', {
+      confirmClose: true,
+      now,
+    });
     expect(started.currentStatus).toBe('open');
     expect(started.pendingOperation?.kind).toBe('close');
+    expect(started.pendingOperation?.startedAt).toBe(new Date(now).toISOString());
     expect(
       Date.parse(started.pendingOperation!.completesAt) -
         Date.parse(started.pendingOperation!.startedAt),
@@ -250,9 +297,10 @@ describe('асинхронные операции', () => {
   });
 
   it('переключает отметку «под вопросом» и записывает оба изменения', () => {
-    const started = applyPortalAction(basePortal, 'mark_under_review');
+    const started = applyPortalAction(basePortal, 'mark_under_review', { now });
     expect(started.currentStatus).toBe('open');
     expect(started.underQuestion).toBe(true);
+    expect(started.eventLog[0].timestamp).toBe(new Date(now).toISOString());
     expect(started.eventLog[0].description).toContain('помечен');
     const cleared = applyPortalAction(started, 'mark_under_review');
     expect(cleared.underQuestion).toBe(false);
@@ -388,6 +436,32 @@ describe('асинхронные операции', () => {
     expect(afterDeadline.eventLog.some((event) => event.action === 'cancel_operation')).toBe(false);
   });
 
+  it('считает наблюдателя оставшимся по другую сторону при схлопывании во время визита', () => {
+    const startedAt = new Date(now).toISOString();
+    const visiting: Portal = {
+      ...basePortal,
+      energyLevel: 1,
+      stability: 54,
+      occupants: 2,
+      energyUpdatedAt: startedAt,
+      baseEnergyDrainPerMinute: 1,
+      pendingOperation: {
+        kind: 'observer',
+        startedAt,
+        completesAt: new Date(now + OBSERVER_VISIT_DURATION_MS).toISOString(),
+        previousStatus: 'open',
+      },
+    };
+    const closed = advancePortals([visiting], now + 2 * 60_000)[0];
+
+    expect(closed.currentStatus).toBe('closed');
+    expect(closed.pendingOperation).toBeNull();
+    expect(closed.occupants).toBe(2);
+    expect(closed.lostOccupants).toBe(2);
+    expect(closed.eventLog[0].action).toBe('collapse_incident');
+    expect(closed.eventLog[0].description).toContain('потеряны 2');
+  });
+
   it('не позволяет случайно списать наблюдателя как обычный выход', () => {
     const solo = {
       ...basePortal,
@@ -448,6 +522,18 @@ describe('асинхронные операции', () => {
     ).toThrow('Вход запрещён');
     expect(() =>
       applyPortalAction(safe, 'record_occupant_entry', { occupantCount: 0 }),
+    ).toThrow('положительное целое число');
+    expect(() =>
+      applyPortalAction({ ...safe, occupants: 1 }, 'record_occupant_entry', {
+        occupantCount: Number.MAX_SAFE_INTEGER,
+        now,
+      }),
+    ).toThrow('безопасный диапазон');
+    expect(() =>
+      applyPortalAction(safe, 'record_occupant_entry', {
+        occupantCount: Number.MAX_SAFE_INTEGER + 1,
+        now,
+      }),
     ).toThrow('положительное целое число');
   });
 
@@ -670,6 +756,15 @@ describe('асинхронные операции', () => {
         occupants: 0,
       }),
     ).toThrow();
+    expect(() =>
+      createPortal({
+        name: 'Слишком много',
+        destination: 'Пустота',
+        energyLevel: 80,
+        stability: 80,
+        occupants: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    ).toThrow();
   });
 });
 
@@ -815,6 +910,19 @@ describe('хранилище порталов', () => {
     expect(result.status).toBe('error');
     expect(result.warning).toContain('Исходные данные не изменены');
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe('{bad json');
+  });
+
+  it('отклоняет сохранённые счётчики, выходящие за безопасный целочисленный диапазон', () => {
+    const invalidPortal = {
+      ...basePortal,
+      occupants: Number.MAX_SAFE_INTEGER + 1,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [invalidPortal] }),
+    );
+
+    expect(loadPortals([]).status).toBe('error');
   });
 
   it('возвращает ошибки чтения и записи хранилища', () => {
