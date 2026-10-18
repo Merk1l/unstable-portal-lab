@@ -8,6 +8,7 @@ import {
   calculateRisk,
   cancelPortalOperation,
   createPortal,
+  DEFAULT_ENERGY_DRAIN_PER_MINUTE,
   DEMO_PORTAL_REOPEN_DELAY_MS,
   evaluatePortal,
   getAccessDecision,
@@ -24,6 +25,7 @@ import {
   RISK_THRESHOLDS,
   summarizePortals,
 } from './portal-rules';
+import { INITIAL_PORTALS } from '../data/initial-portals';
 import type { Portal } from '../types';
 import { loadPortals, savePortals, STORAGE_KEY } from './storage';
 
@@ -49,6 +51,37 @@ const basePortal: Portal = {
 };
 
 describe('модель риска и допуска', () => {
+  it('рассчитывает 180 минут при полном запасе и стабильности', () => {
+    const portal = createPortal({
+      name: 'Полный запас',
+      destination: 'Тихая долина',
+      energyLevel: 100,
+      stability: 100,
+      occupants: 0,
+    });
+
+    expect(DEFAULT_ENERGY_DRAIN_PER_MINUTE).toBeCloseTo(100 / 180);
+    expect(portal.baseEnergyDrainPerMinute).toBeCloseTo(100 / 180);
+    expect(portal.timeToCollapseMinutes).toBeCloseTo(180);
+  });
+
+  it('сохраняет согласованность энергетической модели во всех стартовых демо-порталах', () => {
+    for (const portal of INITIAL_PORTALS) {
+      expect(portal.baseEnergyDrainPerMinute).toBeCloseTo(DEFAULT_ENERGY_DRAIN_PER_MINUTE);
+      if (portal.currentStatus !== 'closed') {
+        expect(portal.timeToCollapseMinutes).toBeCloseTo(
+          portal.energyLevel /
+            (DEFAULT_ENERGY_DRAIN_PER_MINUTE * (2 - portal.stability / 100)),
+        );
+      }
+    }
+    expect(INITIAL_PORTALS.find((portal) => portal.id === 'portal-j8')).toMatchObject({
+      energyLevel: 100,
+      stability: 100,
+      timeToCollapseMinutes: 180,
+    });
+  });
+
   it('проверяет границы уровней риска', () => {
     expect(getRiskLevel(RISK_THRESHOLDS.moderate - 1)).toBe('low');
     expect(getRiskLevel(RISK_THRESHOLDS.moderate)).toBe('moderate');
@@ -958,6 +991,25 @@ describe('хранилище порталов', () => {
       status: 'loaded',
       portals: [],
     });
+  });
+
+  it('мигрирует сохранённый стартовый портал на новую базовую скорость', () => {
+    const template = INITIAL_PORTALS.find((portal) => portal.id === 'portal-j8')!;
+    const previousVersion = {
+      ...template,
+      energyLevel: 100,
+      stability: 100,
+      baseEnergyDrainPerMinute: 1,
+      timeToCollapseMinutes: 100,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [previousVersion] }),
+    );
+
+    const loaded = loadPortals(INITIAL_PORTALS).portals[0];
+    expect(loaded.baseEnergyDrainPerMinute).toBeCloseTo(DEFAULT_ENERGY_DRAIN_PER_MINUTE);
+    expect(loaded.timeToCollapseMinutes).toBeCloseTo(180);
   });
 
   it('при загрузке удаляет закрытый архивный дубль и сохраняет его события у активного портала', () => {

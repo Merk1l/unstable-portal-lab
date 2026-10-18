@@ -6,7 +6,11 @@ import type {
   PortalOperation,
   PortalStatus,
 } from '../types';
-import { normalizePortalName } from './portal-rules';
+import {
+  DEFAULT_ENERGY_DRAIN_PER_MINUTE,
+  getEnergyDrainMultiplier,
+  normalizePortalName,
+} from './portal-rules';
 
 export const STORAGE_KEY = 'portal-control-system:v1';
 
@@ -117,6 +121,34 @@ function removeDuplicatePortalNames(portals: Portal[]): Portal[] {
       ).values(),
     ].sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
     return { ...retained, eventLog };
+  });
+}
+
+function migrateDemoEnergyModel(portals: Portal[], seed: Portal[]): Portal[] {
+  return portals.map((portal) => {
+    if (portal.currentStatus === 'closed') {
+      return portal;
+    }
+    const template = seed.find(
+      (candidate) =>
+        portal.id === candidate.id ||
+        (portal.id.startsWith(`${candidate.id}-cycle-`) &&
+          /^\d+$/.test(portal.id.slice(`${candidate.id}-cycle-`.length))),
+    );
+    if (!template) {
+      return portal;
+    }
+
+    const timeToCollapseMinutes =
+      portal.energyLevel /
+      (DEFAULT_ENERGY_DRAIN_PER_MINUTE * getEnergyDrainMultiplier(portal.stability));
+    return {
+      ...portal,
+      baseEnergyDrainPerMinute: DEFAULT_ENERGY_DRAIN_PER_MINUTE,
+      timeToCollapseMinutes,
+      collapseEstimateUpdatedAt:
+        portal.energyUpdatedAt ?? portal.collapseEstimateUpdatedAt ?? portal.lastUpdated,
+    };
   });
 }
 
@@ -384,9 +416,9 @@ export function loadPortals(seed: Portal[]): PortalLoadResult {
     if (parsedPortals.some((portal) => portal === null)) {
       throw new Error('В сохранённых данных есть некорректная запись портала.');
     }
-    const portals = removeDuplicatePortalNames(
+    const portals = migrateDemoEnergyModel(removeDuplicatePortalNames(
       parsedPortals.filter((portal): portal is Portal => portal !== null),
-    );
+    ), seed);
     return {
       status: 'loaded',
       portals,

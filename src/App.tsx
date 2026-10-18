@@ -7,9 +7,11 @@ import {
   applyPortalAction,
   cancelPortalOperation,
   createPortal,
+  DEFAULT_ENERGY_DRAIN_PER_MINUTE,
   evaluatePortal,
   getEnergyAt,
   getEnergyDrainRate,
+  getEnergyDrainMultiplier,
   getRecommendedAction,
   getStabilizationPreview,
   normalizePortalName,
@@ -224,6 +226,7 @@ function App() {
   );
   const isReadOnly =
     persistenceMode === 'blocked_read' || persistenceMode === 'blocked_write';
+  const noticeIsRejection = notice?.startsWith('Действие отклонено:') ?? false;
 
   const persist = (nextPortals: Portal[]) => {
     setPortals(nextPortals);
@@ -505,8 +508,16 @@ function App() {
             </div>
           )}
           {notice && (
-            <p role="status" className="mt-4 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
-              {notice}
+            <p
+              role={noticeIsRejection ? 'alert' : 'status'}
+              className={`mt-4 rounded-xl border px-4 py-3 text-sm ${
+                noticeIsRejection
+                  ? 'border-rose-500/50 bg-rose-500/10 text-rose-100'
+                  : 'border-cyan-500/40 bg-cyan-500/10 text-cyan-100'
+              }`}
+            >
+              {noticeIsRejection && <strong className="mr-1">Действие отклонено.</strong>}
+              {noticeIsRejection ? notice.replace(/^Действие отклонено:\s*/, '') : notice}
             </p>
           )}
           <nav aria-label="Разделы" className="mt-6 flex flex-wrap gap-2 border-t border-slate-800 pt-4">
@@ -1094,8 +1105,11 @@ function App() {
             </div>
             <p className="mt-3 text-xs leading-5 text-slate-400">
               Время до схлопывания рассчитывается автоматически из запаса энергии и стабильности. При текущих значениях прогноз: {formatDuration(
-                (draft.energyLevel / (2 - draft.stability / 100)) * 60,
-              )}; базовый расход — 1 процентный пункт запаса в минуту при стабильности 100%.
+                (draft.energyLevel /
+                  (DEFAULT_ENERGY_DRAIN_PER_MINUTE *
+                    getEnergyDrainMultiplier(draft.stability))) *
+                  60,
+              )}; при стабильности 100% базовый расход — {DEFAULT_ENERGY_DRAIN_PER_MINUTE.toFixed(2)} процентного пункта в минуту.
             </p>
             <button type="submit" disabled={isReadOnly || duplicatePortalName} className="mt-5 rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
               Создать запись
@@ -1321,8 +1335,9 @@ function Worklog() {
             <li>В ранней модели стабилизация произвольно добавляла время, не связывая его с ценой энергии. По уточнению пользователя цена и новая стабильность теперь меняют запас и расчётный темп расхода.</li>
             <li>Для закрытых порталов отсутствие активного ETA могло участвовать в обычной оценке риска. Исправлено: закрытая запись не получает активный риск и ETA.</li>
             <li>Пользователь уточнил, что схлопывание нельзя задерживать ради обработки инцидента и что потерянные — та же группа, что осталась по другую сторону. Правила закрытия, журнал и архив согласованы с этим требованием.</li>
-            <li>В демо-цикле интервал сначала был ошибочно рассчитан как 150 часов вместо 150 минут. Ошибка обнаружена проверкой в браузере, исправлена и закреплена тестом точного значения.</li>
             <li>При замене закрытой итерации длина массива не менялась, поэтому UI мог не обновиться. Исправлено отслеживанием самого факта замены и тестом архива.</li>
+            <li>В карточке создаваемого портала базовый расход и прогноз не соответствовали шкале риска: при 100% энергии и стабильности получалось 100 минут вместо 180. Расход, прогноз, демо-записи и миграция стартовых сохранений согласованы тестами.</li>
+            <li>При недопустимой операции отказ был заметен главным образом в журнале. Теперь причина отказа дополнительно показывается в интерфейсе как контрастное доступное предупреждение.</li>
           </ul>
         </div>
       </div>
@@ -1372,9 +1387,9 @@ function Worklog() {
         <div>
           <h3 className="font-semibold text-white">Реальные проверки и ручные сценарии</h3>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
-            <li>Автоматические тесты: Vitest, 65 тестов в 2 файлах — пройдены в текущем аудите.</li>
+            <li>Автоматические тесты: Vitest, 69 тестов в 2 файлах — пройдены в последней проверке изменений.</li>
             <li>Сборка TypeScript/Vite, Oxlint и `git diff --check` — пройдены в текущем аудите.</li>
-            <li>В локальном Chrome проверены пятиминутный визит наблюдателя с учётом внутри и блокировка повторного названия; цикл и очистка архива покрыты автотестами.</li>
+            <li>По ручной проверке, описанной в README: опубликованная версия GitHub Pages и локальный запуск; создание порталов, стабилизация, визит наблюдателя, отметка «под вопросом», вход и выход существ, журнал и архив, а также сценарии схлопывания и недопустимых действий.</li>
           </ul>
         </div>
       </div>

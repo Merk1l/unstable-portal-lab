@@ -1,4 +1,8 @@
 import type { Portal } from '../types';
+import {
+  DEFAULT_ENERGY_DRAIN_PER_MINUTE,
+  getEnergyDrainMultiplier,
+} from '../lib/portal-rules';
 
 const baseDate = new Date().toISOString();
 
@@ -16,7 +20,7 @@ const buildEvent = (
   timestamp: baseDate,
 });
 
-export const INITIAL_PORTALS: Portal[] = [
+const PORTAL_TEMPLATES: Portal[] = [
   {
     id: 'portal-a1',
     name: 'A1 — Красные ворота',
@@ -175,9 +179,9 @@ export const INITIAL_PORTALS: Portal[] = [
     id: 'portal-j8',
     name: 'J8 — Тихий пролёт',
     destination: 'Озёрный мир',
-    energyLevel: 27,
-    stability: 96,
-    timeToCollapseMinutes: 240,
+    energyLevel: 100,
+    stability: 100,
+    timeToCollapseMinutes: 180,
     collapseEstimateUpdatedAt: baseDate,
     collapseDeadlineAt: null,
     occupants: 0,
@@ -226,3 +230,28 @@ export const INITIAL_PORTALS: Portal[] = [
     eventLog: [],
   },
 ];
+
+export const INITIAL_PORTALS = PORTAL_TEMPLATES.map((portal) => {
+  if (portal.currentStatus === 'closed') {
+    return { ...portal, baseEnergyDrainPerMinute: DEFAULT_ENERGY_DRAIN_PER_MINUTE };
+  }
+
+  const targetMinutes = Math.min(portal.timeToCollapseMinutes, 180);
+  const energyLevel = Math.min(
+    100,
+    Math.max(
+      1,
+      targetMinutes *
+        DEFAULT_ENERGY_DRAIN_PER_MINUTE *
+        getEnergyDrainMultiplier(portal.stability),
+    ),
+  );
+  return {
+    ...portal,
+    energyLevel,
+    baseEnergyDrainPerMinute: DEFAULT_ENERGY_DRAIN_PER_MINUTE,
+    timeToCollapseMinutes:
+      energyLevel /
+      (DEFAULT_ENERGY_DRAIN_PER_MINUTE * getEnergyDrainMultiplier(portal.stability)),
+  };
+});

@@ -163,7 +163,35 @@ describe('панель управления', () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: 'Отправить наблюдателя' }));
 
-    expect(screen.getByRole('status')).toHaveTextContent('Действие отклонено');
+    expect(screen.getByRole('alert')).toHaveTextContent('Действие отклонено');
+    expect(screen.getByRole('alert')).toHaveTextContent('критическим риском');
+    await waitFor(() =>
+      expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"result":"blocked"'),
+    );
+  });
+
+  it('показывает заметное предупреждение при отказе в стабилизации', async () => {
+    const lowEnergy = {
+      ...INITIAL_PORTALS[1],
+      energyLevel: 1,
+      energyUpdatedAt: new Date().toISOString(),
+      baseEnergyDrainPerMinute: 100 / 180,
+      stability: 70,
+      timeToCollapseMinutes: 1 / ((100 / 180) * 1.3),
+      collapseEstimateUpdatedAt: new Date().toISOString(),
+      collapseDeadlineAt: new Date(Date.now() + 1 / ((100 / 180) * 1.3) * 60_000).toISOString(),
+      occupants: 0,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [lowEnergy] }),
+    );
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Стабилизировать' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Действие отклонено');
+    expect(screen.getByRole('alert')).toHaveTextContent('Недостаточно энергии');
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"result":"blocked"'),
     );
