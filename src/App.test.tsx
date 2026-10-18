@@ -116,6 +116,33 @@ describe('панель управления', () => {
     expect(attentionItems[3]).toHaveTextContent('Проверить этот портал');
   });
 
+  it('показывает отметку «под вопросом» вместе с причиной допуска в очереди внимания', () => {
+    const timestamp = new Date().toISOString();
+    const portal = {
+      ...INITIAL_PORTALS[1],
+      energyLevel: 80,
+      energyUpdatedAt: timestamp,
+      baseEnergyDrainPerMinute: 100 / 180,
+      stability: 50,
+      timeToCollapseMinutes: 96,
+      collapseEstimateUpdatedAt: timestamp,
+      collapseDeadlineAt: new Date(Date.now() + 96 * 60_000).toISOString(),
+      occupants: 0,
+      underQuestion: true,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [portal] }),
+    );
+    render(<App />);
+
+    const queueItem = screen.getAllByRole('button').find((button) =>
+      button.textContent?.includes('Приоритет '),
+    );
+    expect(queueItem).toHaveTextContent('Допуск требует проверки');
+    expect(queueItem).toHaveTextContent('Отмечен «под вопросом» · обратите внимание.');
+  });
+
   it('восстанавливает демо-данные только после явного подтверждения', async () => {
     const customPortal = {
       ...INITIAL_PORTALS[1],
