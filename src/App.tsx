@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { INITIAL_PORTALS } from './data/initial-portals';
 import {
   advancePortals,
+  advanceDemoPortalCycles,
   applyPortalAction,
   cancelPortalOperation,
   createPortal,
@@ -13,6 +14,7 @@ import {
   getStabilizationPreview,
   OPERATION_DURATIONS_MS,
   recordBlockedAction,
+  resetDemoPortals,
   summarizePortals,
 } from './lib/portal-rules';
 import { loadPortals, savePortals } from './lib/storage';
@@ -26,6 +28,7 @@ type OccupantAdjustment = {
   count: string;
 };
 type CloseConfirmation = { portalId: string; name: string; occupants: number };
+const DEMO_CYCLE_DELAY_LABEL = '2 ч 30 мин';
 const APP_START_TIME = Date.now();
 
 const actionLabels: Record<PortalAction, string> = {
@@ -127,15 +130,17 @@ function App() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [occupantAdjustment, setOccupantAdjustment] = useState<OccupantAdjustment | null>(null);
   const [closeConfirmation, setCloseConfirmation] = useState<CloseConfirmation | null>(null);
+  const [resetConfirmation, setResetConfirmation] = useState(false);
   const [archiveSelectedId, setArchiveSelectedId] = useState<string | null>(null);
 
   useEffect(() => {
     const clock = window.setInterval(() => {
       setNow(Date.now());
       const tickTime = Date.now();
-      setPortals((current) =>
-        advancePortals(current, tickTime),
-      );
+      setPortals((current) => {
+        const advanced = advancePortals(current, tickTime);
+        return advanceDemoPortalCycles(advanced, INITIAL_PORTALS, tickTime);
+      });
     }, 1_000);
     return () => window.clearInterval(clock);
   }, []);
@@ -376,6 +381,23 @@ function App() {
     setNotice('Включён режим работы без сохранения.');
   };
 
+  const restoreDemoData = () => {
+    if (isReadOnly) {
+      setNotice('Восстановление приостановлено: восстановите хранилище или явно выберите работу без сохранения.');
+      return;
+    }
+    const restored = resetDemoPortals(INITIAL_PORTALS);
+    persist(restored);
+    setSelectedId(restored.find((portal) => portal.currentStatus !== 'closed')?.id ?? null);
+    setArchiveSelectedId(null);
+    setOccupantAdjustment(null);
+    setCloseConfirmation(null);
+    setResetConfirmation(false);
+    setShowCreateForm(false);
+    setScreen('overview');
+    setNotice('Демонстрационные данные восстановлены, временные отметки обновлены.');
+  };
+
   const actionConfig = selectedPortal && selectedEvaluation
     ? [
         {
@@ -427,17 +449,27 @@ function App() {
                 Безопасность порталов
               </h1>
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                setDraft(emptyDraft);
-                setShowCreateForm(true);
-              }}
-              disabled={isReadOnly}
-              className="rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Добавить портал
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setResetConfirmation(true)}
+                disabled={isReadOnly}
+                className="rounded-xl border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-amber-400/60 hover:text-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Восстановить демо-данные
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDraft(emptyDraft);
+                  setShowCreateForm(true);
+                }}
+                disabled={isReadOnly}
+                className="rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Добавить портал
+              </button>
+            </div>
           </div>
 
           {storageWarning && (
@@ -495,6 +527,9 @@ function App() {
 
         {screen === 'overview' && (
           <>
+            <p className="mb-4 text-sm text-slate-400">
+              Закрытые стартовые порталы автоматически возвращаются новой итерацией через {DEMO_CYCLE_DELAY_LABEL}; архивная история сохраняется.
+            </p>
             <section aria-label="Сводка" className="mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               {[
                 { label: 'Открытые порталы', value: summary.openPortals, color: 'text-cyan-300' },
@@ -1056,6 +1091,49 @@ function App() {
           </form>
         </div>
       )}
+      {resetConfirmation && (
+        <div
+          className="fixed inset-0 z-20 flex items-center justify-center bg-slate-950/85 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setResetConfirmation(false);
+            }
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="demo-reset-title"
+            className="w-full max-w-lg rounded-2xl border border-amber-500/40 bg-slate-900 p-6"
+          >
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-300">
+              Сброс демонстрации
+            </p>
+            <h2 id="demo-reset-title" className="mt-2 text-xl font-semibold text-white">
+              Восстановить исходный набор порталов?
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-slate-300">
+              Текущие локальные изменения, созданные порталы, архив и журнал будут заменены исходным демонстрационным набором. Таймеры начнут отсчёт заново.
+            </p>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setResetConfirmation(false)}
+                className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={restoreDemoData}
+                className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-300"
+              >
+                Подтвердить сброс
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {closeConfirmation && (
         <div
           className="fixed inset-0 z-20 flex items-center justify-center bg-slate-950/85 p-4"
@@ -1207,8 +1285,8 @@ function Worklog() {
           </li>
           <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
             <h4 className="font-medium text-white">9. Документация и публикация</h4>
-            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> попросил русскоязычный README, прозрачный Worklog и опубликованный сайт. <strong>AI:</strong> обновлял README и Worklog, настроил Vite base и GitHub Actions для GitHub Pages.</p>
-            <p className="mt-2 text-xs text-slate-500">Ключевой запрос: описывать только реализованное и проверять опубликованный адрес, не подменяя реальную доступность настройкой репозитория.</p>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> попросил русскоязычный README, прозрачный Worklog, опубликованный сайт и повторяемую демонстрацию. <strong>AI:</strong> обновлял README и Worklog, настроил Vite base и GitHub Actions для GitHub Pages, добавил восстановление исходных данных и цикл стартовых порталов с сохранением архива.</p>
+            <p className="mt-2 text-xs text-slate-500">Ключевой запрос: через 2–3 часа повторять стартовые демонстрационные порталы и дать проверяющему возможность вручную вернуть исходное состояние.</p>
           </li>
         </ol>
       </div>
@@ -1221,6 +1299,8 @@ function Worklog() {
             <li>Нулевая энергия или нулевая стабильность вызывают немедленное схлопывание без дополнительного окна.</li>
             <li>Оставшиеся при схлопывании фиксируются как потери в критическом происшествии и не учитываются второй группой.</li>
             <li>Закрытые порталы живут в отдельном архиве; сведения о людях по другую сторону сохраняются.</li>
+            <li>Стартовый демонстрационный портал автоматически появляется новой итерацией через 2 часа 30 минут после закрытия; архивная запись сохраняется.</li>
+            <li>Проверяющий может вручную восстановить исходный набор с обновлёнными временными отметками после подтверждения.</li>
           </ul>
         </div>
         <div>
@@ -1260,9 +1340,9 @@ function Worklog() {
         <div>
           <h3 className="font-semibold text-white">Реальные проверки и ручные сценарии</h3>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
-            <li>Автоматические тесты: Vitest, 53 теста в 2 файлах — пройдены в текущем аудите.</li>
+            <li>Автоматические тесты: Vitest, 58 тестов в 2 файлах — пройдены в текущем аудите.</li>
             <li>Сборка TypeScript/Vite, Oxlint и `git diff --check` — пройдены в текущем аудите.</li>
-            <li>Ручной проход по интерфейсу в браузере в этом аудите не выполнялся; сценарии для него перечислены в README.</li>
+            <li>В локальном Chrome проверены повторное открытие демо-портала с сохранением закрытой записи в архиве и подтверждённое восстановление исходных 11 записей; полный ручной прогон остальных сценариев не выполнялся.</li>
             <li>GitHub Pages и ресурсы последней опубликованной версии отвечают отдельно от локальной сборки; изменения этого аудита пока не опубликованы.</li>
           </ul>
         </div>

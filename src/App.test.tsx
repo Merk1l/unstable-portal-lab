@@ -20,7 +20,9 @@ describe('панель управления', () => {
     render(<App />);
     expect(screen.getAllByRole('button').some((button) => button.textContent?.includes('A1'))).toBe(true);
     expect(screen.getByText('Очередь внимания')).toBeInTheDocument();
-    expect(screen.queryByText(/демо|демонстрацион/i)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Восстановить демо-данные' }),
+    ).toBeInTheDocument();
     expect(
       screen.getAllByText(
         /^(Низкий|Средний|Высокий|Критический) риск · (\d+:\d{2}|\d+ сек|Закрыт) · внутри: \d+$/,
@@ -53,6 +55,35 @@ describe('панель управления', () => {
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('create_portal'),
     );
+  });
+
+  it('восстанавливает демо-данные только после явного подтверждения', async () => {
+    const customPortal = {
+      ...INITIAL_PORTALS[1],
+      id: 'user-created-portal',
+      name: 'Пользовательский портал',
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [customPortal] }),
+    );
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Восстановить демо-данные' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('будут заменены');
+    fireEvent.click(screen.getByRole('button', { name: 'Отмена' }));
+    expect(window.localStorage.getItem(STORAGE_KEY)).toContain('user-created-portal');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Восстановить демо-данные' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Подтвердить сброс' }));
+    expect(screen.getByText(/Демонстрационные данные восстановлены/)).toBeInTheDocument();
+    expect(screen.getByText('Закрытые стартовые порталы автоматически возвращаются новой итерацией через 2 ч 30 мин; архивная история сохраняется.')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(window.localStorage.getItem(STORAGE_KEY)).not.toContain('user-created-portal'),
+    );
+    expect(screen.getAllByRole('button').some((button) =>
+      button.textContent?.includes('A1 — Красные ворота'),
+    )).toBe(true);
   });
 
   it('показывает встроенный Worklog и честно сообщает о неизвестном времени и токенах', () => {

@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ACCESS_THRESHOLDS,
   advancePortals,
+  advanceDemoPortalCycles,
   applyPortalAction,
   calculateRisk,
   cancelPortalOperation,
   createPortal,
+  DEMO_PORTAL_REOPEN_DELAY_MS,
   evaluatePortal,
   getAccessDecision,
   getCollapseAt,
@@ -18,6 +20,7 @@ import {
   OPERATION_DURATIONS_MS,
   OBSERVER_VISIT_DURATION_MS,
   recordBlockedAction,
+  resetDemoPortals,
   RISK_THRESHOLDS,
   summarizePortals,
 } from './portal-rules';
@@ -155,6 +158,88 @@ describe('модель риска и допуска', () => {
 });
 
 describe('асинхронные операции', () => {
+  it('задаёт интервал демо-цикла ровно в 2 часа 30 минут', () => {
+    expect(DEMO_PORTAL_REOPEN_DELAY_MS).toBe(150 * 60_000);
+  });
+
+  it('перезапускает закрытый демо-портал через 2,5 часа, сохраняя закрытую итерацию', () => {
+    const template: Portal = {
+      ...basePortal,
+      id: 'demo-portal',
+      currentStatus: 'open',
+      pendingOperation: null,
+      closedAt: null,
+    };
+    const closed: Portal = {
+      ...template,
+      currentStatus: 'closed',
+      closedAt: new Date(now - DEMO_PORTAL_REOPEN_DELAY_MS).toISOString(),
+    };
+
+    const beforeDelay = advanceDemoPortalCycles(
+      [closed],
+      [template],
+      now - 1,
+    );
+    expect(beforeDelay).toHaveLength(1);
+
+    const reopened = advanceDemoPortalCycles([closed], [template], now);
+    expect(reopened).toHaveLength(2);
+    expect(reopened[0]).toBe(closed);
+    expect(reopened[1]).toMatchObject({
+      id: 'demo-portal-cycle-1',
+      currentStatus: 'open',
+      pendingOperation: null,
+      closedAt: null,
+      occupants: template.occupants,
+      energyUpdatedAt: new Date(now).toISOString(),
+    });
+    expect(reopened[1].eventLog[0].description).toContain('итерация 1');
+    expect(advanceDemoPortalCycles(reopened, [template], now + 1)).toBe(reopened);
+  });
+
+  it('не перезапускает созданные пользователем порталы', () => {
+    const userPortal: Portal = {
+      ...basePortal,
+      id: 'user-created-portal',
+      currentStatus: 'closed',
+      closedAt: new Date(now - DEMO_PORTAL_REOPEN_DELAY_MS * 2).toISOString(),
+    };
+
+    const portals = [userPortal];
+    expect(advanceDemoPortalCycles(portals, [basePortal], now)).toBe(portals);
+  });
+
+  it('восстанавливает демо-данные с обновлёнными временными отметками', () => {
+    const inProgress: Portal = {
+      ...basePortal,
+      eventLog: [
+        {
+          id: 'pending-test-event',
+          timestamp: new Date(now - 30_000).toISOString(),
+          portalId: basePortal.id,
+          action: 'stabilize',
+          result: 'in_progress',
+          description: 'Стабилизация выполняется.',
+        },
+      ],
+      pendingOperation: {
+        kind: 'stabilize',
+        startedAt: new Date(now - 30_000).toISOString(),
+        completesAt: new Date(now + 90_000).toISOString(),
+        previousStatus: 'open',
+      },
+    };
+    const restored = resetDemoPortals([inProgress], now)[0];
+
+    expect(restored.pendingOperation).toBeNull();
+    expect(restored.energyUpdatedAt).toBe(new Date(now).toISOString());
+    expect(restored.collapseEstimateUpdatedAt).toBe(new Date(now).toISOString());
+    expect(restored.eventLog[0].timestamp).toBe(new Date(now).toISOString());
+    expect(restored.energyLevel).toBe(inProgress.energyLevel);
+    expect(restored.stability).toBe(inProgress.stability);
+  });
+
   it('расходует энергию и пересчитывает прогноз после завершения стабилизации', () => {
     const portal: Portal = {
       ...basePortal,

@@ -41,6 +41,7 @@ export const DEFAULT_ENERGY_DRAIN_PER_MINUTE = 1;
 export const ENERGY_COST_PER_STABILIZATION = 12;
 export const STABILITY_GAIN_PER_STABILIZATION = 20;
 export const STABILITY_LOSS_PER_ENTRY = 1;
+export const DEMO_PORTAL_REOPEN_DELAY_MS = 150 * MINUTE_MS;
 export const OBSERVER_VISIT_DURATION_MS = 10 * MINUTE_MS;
 export const OBSERVER_CLEARANCE_VALID_MS = 30 * MINUTE_MS;
 export const OPERATION_DURATIONS_MS: Record<PortalOperationKind, number> = {
@@ -489,6 +490,103 @@ export function createPortal(draft: PortalDraft): Portal {
     return collapseImmediately(created, Date.parse(now), 'energy');
   }
   return created;
+}
+
+export function resetDemoPortals(templates: Portal[], now = Date.now()): Portal[] {
+  const timestamp = new Date(now).toISOString();
+  return templates.map((portal) => {
+    const baseEnergyDrainPerMinute = getBaseEnergyDrainPerMinute(portal);
+    return {
+      ...portal,
+      energyUpdatedAt: timestamp,
+      baseEnergyDrainPerMinute,
+      collapseEstimateUpdatedAt: timestamp,
+      collapseDeadlineAt: null,
+      lastUpdated: timestamp,
+      closedAt: portal.currentStatus === 'closed' ? timestamp : null,
+      pendingOperation: null,
+      incidentReviewedAt: null,
+      observerVerifiedAt: null,
+      eventLog: portal.eventLog.map((event, index) => ({
+        ...event,
+        id: `${portal.id}:reset:${now}:${index}`,
+        timestamp,
+      })),
+    };
+  });
+}
+
+export function advanceDemoPortalCycles(
+  portals: Portal[],
+  templates: Portal[],
+  now = Date.now(),
+): Portal[] {
+  const nextPortals = [...portals];
+  const timestamp = new Date(now).toISOString();
+
+  for (const template of templates) {
+    const cyclePrefix = `${template.id}-cycle-`;
+    const instances = nextPortals.filter(
+      (portal) =>
+        portal.id === template.id ||
+        (portal.id.startsWith(cyclePrefix) &&
+          /^\d+$/.test(portal.id.slice(cyclePrefix.length))),
+    );
+    if (instances.length === 0 || instances.some((portal) => portal.currentStatus !== 'closed')) {
+      continue;
+    }
+
+    const lastClosedAt = Math.max(
+      ...instances.map((portal) => Date.parse(portal.closedAt ?? portal.lastUpdated)),
+    );
+    if (
+      !Number.isFinite(lastClosedAt) ||
+      now < lastClosedAt + DEMO_PORTAL_REOPEN_DELAY_MS ||
+      template.energyLevel <= 0 ||
+      template.stability <= 0
+    ) {
+      continue;
+    }
+
+    const cycleNumber = instances.reduce((latest, portal) => {
+      if (portal.id === template.id) {
+        return Math.max(latest, 0);
+      }
+      return Math.max(latest, Number(portal.id.slice(cyclePrefix.length)) || 0);
+    }, 0) + 1;
+    const id = `${cyclePrefix}${cycleNumber}`;
+    const baseEnergyDrainPerMinute = getBaseEnergyDrainPerMinute(template);
+    const reopened: Portal = {
+      ...template,
+      id,
+      energyUpdatedAt: timestamp,
+      baseEnergyDrainPerMinute,
+      collapseEstimateUpdatedAt: timestamp,
+      collapseDeadlineAt: null,
+      currentStatus: 'open',
+      lastUpdated: timestamp,
+      pendingOperation: null,
+      lostOccupants: 0,
+      incidentReviewedAt: null,
+      closedAt: null,
+      closureReason: null,
+      observerVerifiedAt: null,
+      notes: 'Автоматически открыта новая демонстрационная итерация. Предыдущие записи сохранены в архиве.',
+      eventLog: [
+        {
+          id: `${id}:${timestamp}:0`,
+          timestamp,
+          portalId: id,
+          action: 'create_portal',
+          result: 'completed',
+          description: `Автоматически открыта демонстрационная итерация ${cycleNumber}; предыдущая запись сохранена в архиве.`,
+        },
+      ],
+    };
+    nextPortals.push(reopened);
+  }
+
+  return nextPortals.length === portals.length ? portals : nextPortals;
 }
 
 export function recordBlockedAction(portal: Portal, action: PortalAction, reason: string): Portal {
