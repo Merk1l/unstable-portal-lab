@@ -179,6 +179,17 @@ describe('панель управления', () => {
     expect(screen.getByRole('heading', { name: 'AI Worklog' })).toBeInTheDocument();
     expect(screen.getByText('Около 6 часов.')).toBeInTheDocument();
     expect(screen.getByText(/Количество токенов не измерялось/)).toBeInTheDocument();
+    expect(screen.getAllByText('Вклад человека')).toHaveLength(5);
+    expect(screen.getAllByText('Вклад AI')).toHaveLength(5);
+    expect(
+      screen.getAllByText('Ключевой промпт — реконструированный пример, не дословная цитата'),
+    ).toHaveLength(5);
+    expect(
+      screen.getByRole('heading', { name: 'Ошибки AI и корректировки' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'Результаты проверок' }),
+    ).toBeInTheDocument();
   });
 
   it('отклоняет критическую отправку наблюдателя и добавляет отказ в журнал', async () => {
