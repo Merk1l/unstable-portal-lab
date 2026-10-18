@@ -203,7 +203,7 @@ describe('панель управления', () => {
 
     expect(screen.getByRole('alertdialog')).toHaveTextContent('Операция отклонена');
     expect(screen.getByRole('alertdialog')).toHaveTextContent('критическим риском');
-    expect(screen.getByRole('alertdialog')).toHaveTextContent('Попытка записана в журнал');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('отказ записан в журнал событий');
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"result":"blocked"'),
     );
@@ -305,6 +305,85 @@ describe('панель управления', () => {
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"occupants":5'),
     );
     expect(window.localStorage.getItem(STORAGE_KEY)).toContain('record_occupant_exit');
+  });
+
+  it('предупреждает о малом остатке и подтверждает выход, который схлопнет портал', async () => {
+    const unstable = {
+      ...INITIAL_PORTALS[0],
+      currentStatus: 'open' as const,
+      energyLevel: 100,
+      stability: 5,
+      occupants: 6,
+      pendingOperation: null,
+      energyUpdatedAt: new Date().toISOString(),
+      collapseEstimateUpdatedAt: new Date().toISOString(),
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [unstable] }),
+    );
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Зафиксировать выход' }));
+    fireEvent.change(screen.getByLabelText('Сколько вышло?'), {
+      target: { value: '1' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Зафиксировать' }));
+
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('останется 4% стабильности');
+    fireEvent.click(
+      within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Отмена' }),
+    );
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').portals[0].occupants).toBe(6);
+
+    fireEvent.change(screen.getByLabelText('Сколько вышло?'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Зафиксировать' }));
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('немедленно схлопнет портал');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Оставшиеся внутри: 1');
+    fireEvent.click(screen.getByRole('button', { name: 'Подтвердить выход' }));
+
+    await waitFor(() => {
+      const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').portals[0];
+      expect(saved.currentStatus).toBe('closed');
+      expect(saved.lostOccupants).toBe(1);
+    });
+  });
+
+  it('отклоняет выход большего количества, чем позволяет стабильность', async () => {
+    const unstable = {
+      ...INITIAL_PORTALS[0],
+      currentStatus: 'open' as const,
+      energyLevel: 100,
+      stability: 5,
+      occupants: 6,
+      pendingOperation: null,
+      energyUpdatedAt: new Date().toISOString(),
+      collapseEstimateUpdatedAt: new Date().toISOString(),
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [unstable] }),
+    );
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Зафиксировать выход' }));
+    fireEvent.change(screen.getByLabelText('Сколько вышло?'), {
+      target: { value: '6' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Зафиксировать' }));
+
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      'текущей стабильности 5% хватает максимум на 5 проходов',
+    );
+    await waitFor(() => {
+      const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').portals[0];
+      expect(saved.occupants).toBe(6);
+      expect(saved.stability).toBe(5);
+      expect(saved.eventLog[0].result).toBe('blocked');
+    });
   });
 
   it('запускает визит наблюдателя и учитывает его внутри на время визита', async () => {

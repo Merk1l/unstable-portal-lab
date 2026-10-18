@@ -11,6 +11,7 @@ import {
   DEFAULT_ENERGY_DRAIN_PER_MINUTE,
   DEMO_PORTAL_REOPEN_DELAY_MS,
   evaluatePortal,
+  getExitStabilityWarning,
   getAccessDecision,
   getCollapseAt,
   getEnergyAt,
@@ -808,6 +809,32 @@ describe('асинхронные операции', () => {
     });
     expect(closed.eventLog[0].description).toContain('потеряны 2');
     expect(closed.eventLog[1].action).toBe('record_occupant_exit');
+  });
+
+  it('предупреждает о низкой стабильности и схлопывании после выхода', () => {
+    const unstable = { ...basePortal, stability: 5, occupants: 10 };
+
+    expect(getExitStabilityWarning(unstable, 1)).toEqual({
+      kind: 'low_stability',
+      stabilityAfter: 4,
+    });
+    expect(getExitStabilityWarning(unstable, 4)).toEqual({
+      kind: 'low_stability',
+      stabilityAfter: 1,
+    });
+    expect(getExitStabilityWarning(unstable, 5)).toEqual({
+      kind: 'collapse',
+      stabilityAfter: 0,
+    });
+    expect(getExitStabilityWarning(unstable, 6)).toBeNull();
+  });
+
+  it('отклоняет выход, если запрошенное число превышает запас стабильности', () => {
+    const unstable = { ...basePortal, stability: 5, occupants: 10 };
+
+    expect(() =>
+      applyPortalAction(unstable, 'record_occupant_exit', { occupantCount: 6 }),
+    ).toThrow('текущей стабильности 5% хватает максимум на 5 проходов');
   });
 
   it('схлопывает по рассчитанному времени и регистрирует оставшихся без окна задержки', () => {

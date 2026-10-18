@@ -9,6 +9,7 @@ import {
   createPortal,
   DEFAULT_ENERGY_DRAIN_PER_MINUTE,
   evaluatePortal,
+  getExitStabilityWarning,
   getEnergyAt,
   getEnergyDrainRate,
   getEnergyDrainMultiplier,
@@ -31,6 +32,14 @@ type OccupantAdjustment = {
   count: string;
 };
 type CloseConfirmation = { portalId: string; name: string; occupants: number };
+type ExitConfirmation = {
+  portalId: string;
+  portalName: string;
+  count: number;
+  kind: 'low_stability' | 'collapse';
+  stabilityAfter: number;
+  remainingOccupants: number;
+};
 type RejectedOperation = { action: PortalAction; portalName: string; reason: string };
 const DEMO_CYCLE_DELAY_LABEL = '2 ч 30 мин';
 const APP_START_TIME = Date.now();
@@ -134,6 +143,7 @@ function App() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [occupantAdjustment, setOccupantAdjustment] = useState<OccupantAdjustment | null>(null);
   const [closeConfirmation, setCloseConfirmation] = useState<CloseConfirmation | null>(null);
+  const [exitConfirmation, setExitConfirmation] = useState<ExitConfirmation | null>(null);
   const [rejectedOperation, setRejectedOperation] = useState<RejectedOperation | null>(null);
   const [resetConfirmation, setResetConfirmation] = useState(false);
   const [archiveSelectedId, setArchiveSelectedId] = useState<string | null>(null);
@@ -307,8 +317,15 @@ function App() {
       const reason = error instanceof Error ? error.message : 'Неизвестная ошибка операции.';
       const blocked = recordBlockedAction(portal, action, reason);
       persist(portals.map((item) => (item.id === portal.id ? blocked : item)));
-      if (action === 'stabilize' || action === 'send_observer') {
+      if (
+        action === 'stabilize' ||
+        action === 'send_observer' ||
+        action === 'record_occupant_exit'
+      ) {
         setNotice(null);
+        if (action === 'record_occupant_exit') {
+          setOccupantAdjustment(null);
+        }
         setRejectedOperation({ action, portalName: portal.name, reason });
       } else {
         setNotice(`Действие отклонено: ${reason}. Попытка записана в журнал.`);
@@ -341,7 +358,22 @@ function App() {
     if (!occupantAdjustment || !selectedPortal || occupantAdjustment.portalId !== selectedPortal.id) {
       return;
     }
-    updatePortal(selectedPortal, occupantAdjustment.action, Number(occupantAdjustment.count));
+    const count = Number(occupantAdjustment.count);
+    if (occupantAdjustment.action === 'record_occupant_exit') {
+      const warning = getExitStabilityWarning(selectedPortal, count);
+      if (warning) {
+        setExitConfirmation({
+          portalId: selectedPortal.id,
+          portalName: selectedPortal.name,
+          count,
+          kind: warning.kind,
+          stabilityAfter: warning.stabilityAfter,
+          remainingOccupants: selectedPortal.occupants - count,
+        });
+        return;
+      }
+    }
+    updatePortal(selectedPortal, occupantAdjustment.action, count);
   };
 
   const handleCreatePortal = (event: FormEvent<HTMLFormElement>) => {
@@ -1227,6 +1259,76 @@ function App() {
           </section>
         </div>
       )}
+      {exitConfirmation && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-slate-950/85 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setExitConfirmation(null);
+            }
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="exit-confirmation-title"
+            className={`w-full max-w-lg rounded-2xl border bg-slate-900 p-6 ${
+              exitConfirmation.kind === 'collapse'
+                ? 'border-rose-500/50'
+                : 'border-amber-500/50'
+            }`}
+          >
+            <p className={`text-xs font-semibold uppercase tracking-[0.18em] ${
+              exitConfirmation.kind === 'collapse' ? 'text-rose-300' : 'text-amber-300'
+            }`}>
+              {exitConfirmation.kind === 'collapse'
+                ? 'Выход приведёт к схлопыванию'
+                : 'Низкий запас стабильности'}
+            </p>
+            <h2 id="exit-confirmation-title" className="mt-2 text-xl font-semibold text-white">
+              Подтвердить выход из «{exitConfirmation.portalName}»?
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-slate-200">
+              {exitConfirmation.kind === 'collapse'
+                ? `Фиксация выхода ${exitConfirmation.count} человек/существ снизит стабильность до 0% и немедленно схлопнет портал. ${
+                    exitConfirmation.remainingOccupants > 0
+                      ? `Оставшиеся внутри: ${exitConfirmation.remainingOccupants}; они будут учтены как потери.`
+                      : 'Внутри никого не останется.'
+                  }`
+                : `После выхода ${exitConfirmation.count} человек/существ останется ${exitConfirmation.stabilityAfter}% стабильности — это критически низкий запас.`}
+            </p>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setExitConfirmation(null)}
+                className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const confirmation = exitConfirmation;
+                  const portal = portals.find((item) => item.id === confirmation.portalId);
+                  setExitConfirmation(null);
+                  if (portal) {
+                    updatePortal(portal, 'record_occupant_exit', confirmation.count);
+                  } else {
+                    setNotice('Не удалось найти портал для фиксации выхода.');
+                  }
+                }}
+                className={`rounded-lg px-4 py-2 text-sm font-semibold text-slate-950 ${
+                  exitConfirmation.kind === 'collapse'
+                    ? 'bg-rose-400 hover:bg-rose-300'
+                    : 'bg-amber-400 hover:bg-amber-300'
+                }`}
+              >
+                Подтвердить выход
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {rejectedOperation && (
         <div
           className="fixed inset-0 z-30 flex items-center justify-center bg-slate-950/85 p-4"
@@ -1252,7 +1354,7 @@ function App() {
               {rejectedOperation.reason}
             </p>
             <p className="mt-2 text-sm text-slate-300">
-              Портал не изменён. Попытка записана в журнал событий.
+              Параметры портала не изменены; отказ записан в журнал событий.
             </p>
             <div className="mt-5 flex justify-end">
               <button
@@ -1382,6 +1484,7 @@ function Worklog() {
             <li>При 100% энергии и стабильности прогноз составлял 100 вместо 180 минут. Базовый расход, демо-порталы и миграция стартовых сохранений приведены к 180-минутной шкале.</li>
             <li>Отказ в стабилизации или отправке наблюдателя был заметен главным образом в журнале; добавлен всплывающий диалог с причиной, а попытка по-прежнему записывается в журнал.</li>
             <li>В очереди не отображалась отметка «под вопросом» рядом с рекомендацией «Допуск требует проверки»; добавлена короткая отдельная отметка.</li>
+            <li>При фиксации выхода не ограничивалось число проходящих запасом стабильности. Добавлены предупреждение с подтверждением при остатке 1–4% или немедленном схлопывании при 0%, а также отказ, если запрошено больше проходов, чем позволяет текущая стабильность.</li>
             <li>Закрытые порталы исключены из текущего риска и ETA; повторная обработка схлопывания не должна создавать новые потери, а замена демо-итерации сохраняет события в журнале.</li>
           </ul>
         </div>
@@ -1390,7 +1493,7 @@ function Worklog() {
         <div>
           <h3 className="font-semibold text-white">Результаты проверок</h3>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
-            <li><strong>Автоматические тесты:</strong> 70 тестов Vitest в 2 файлах — пройдены.</li>
+            <li><strong>Автоматические тесты:</strong> 74 теста Vitest в 2 файлах — пройдены.</li>
             <li><strong>Сборка:</strong> TypeScript/Vite — пройдена.</li>
             <li><strong>Lint:</strong> Oxlint — пройден.</li>
             <li><strong>Проверка diff:</strong> <code>git diff --check</code> — пройдена.</li>

@@ -22,6 +22,7 @@ export const RISK_THRESHOLDS = {
 } as const;
 
 export const OBSERVER_MIN_COLLAPSE_WINDOW_MINUTES = 15;
+export const EXIT_STABILITY_WARNING_THRESHOLD = 5;
 
 export const ACCESS_THRESHOLDS = {
   allowedMaxRisk: 35,
@@ -41,6 +42,31 @@ export const DEFAULT_ENERGY_DRAIN_PER_MINUTE = 100 / RISK_CALIBRATION_MINUTES;
 export const ENERGY_COST_PER_STABILIZATION = 12;
 export const STABILITY_GAIN_PER_STABILIZATION = 20;
 export const STABILITY_LOSS_PER_ENTRY = 1;
+
+export function getExitStabilityWarning(
+  portal: Portal,
+  count: number,
+): { kind: 'low_stability' | 'collapse'; stabilityAfter: number } | null {
+  if (
+    !Number.isSafeInteger(count) ||
+    count < 1 ||
+    count > Math.floor(portal.stability / STABILITY_LOSS_PER_ENTRY)
+  ) {
+    return null;
+  }
+  const stabilityAfter = clamp(
+    portal.stability - count * STABILITY_LOSS_PER_ENTRY,
+    0,
+    100,
+  );
+  if (stabilityAfter <= 0) {
+    return { kind: 'collapse', stabilityAfter: 0 };
+  }
+  if (stabilityAfter < EXIT_STABILITY_WARNING_THRESHOLD) {
+    return { kind: 'low_stability', stabilityAfter };
+  }
+  return null;
+}
 export const DEMO_PORTAL_REOPEN_DELAY_MS = 150 * MINUTE_MS;
 export const OBSERVER_VISIT_DURATION_MS = 5 * MINUTE_MS;
 export const OBSERVER_CLEARANCE_VALID_MS = 30 * MINUTE_MS;
@@ -778,6 +804,12 @@ export function applyPortalAction(
         countedObserver
           ? `Нельзя зафиксировать выход ${count}: внутри ${otherOccupants} остальных, наблюдатель ещё не вернулся.`
           : `Нельзя зафиксировать выход ${count}: внутри только ${portal.occupants}.`,
+      );
+    }
+    const maxExitCount = Math.floor(portal.stability / STABILITY_LOSS_PER_ENTRY);
+    if (count > maxExitCount) {
+      throw new Error(
+        `Нельзя зафиксировать выход ${count}: текущей стабильности ${portal.stability}% хватает максимум на ${maxExitCount} проходов.`,
       );
     }
     const remainingOccupants = portal.occupants - count;
