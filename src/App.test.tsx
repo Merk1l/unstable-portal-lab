@@ -201,11 +201,14 @@ describe('панель управления', () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: 'Отправить наблюдателя' }));
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Действие отклонено');
-    expect(screen.getByRole('alert')).toHaveTextContent('критическим риском');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Операция отклонена');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('критическим риском');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Попытка записана в журнал');
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"result":"blocked"'),
     );
+    fireEvent.click(screen.getByRole('button', { name: 'Понятно' }));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
   it('показывает заметное предупреждение при отказе в стабилизации', async () => {
@@ -228,8 +231,8 @@ describe('панель управления', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Стабилизировать' }));
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Действие отклонено');
-    expect(screen.getByRole('alert')).toHaveTextContent('Недостаточно энергии');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Операция отклонена');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Недостаточно энергии');
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"result":"blocked"'),
     );

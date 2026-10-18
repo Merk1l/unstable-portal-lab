@@ -31,6 +31,7 @@ type OccupantAdjustment = {
   count: string;
 };
 type CloseConfirmation = { portalId: string; name: string; occupants: number };
+type RejectedOperation = { action: PortalAction; portalName: string; reason: string };
 const DEMO_CYCLE_DELAY_LABEL = '2 ч 30 мин';
 const APP_START_TIME = Date.now();
 
@@ -133,6 +134,7 @@ function App() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [occupantAdjustment, setOccupantAdjustment] = useState<OccupantAdjustment | null>(null);
   const [closeConfirmation, setCloseConfirmation] = useState<CloseConfirmation | null>(null);
+  const [rejectedOperation, setRejectedOperation] = useState<RejectedOperation | null>(null);
   const [resetConfirmation, setResetConfirmation] = useState(false);
   const [archiveSelectedId, setArchiveSelectedId] = useState<string | null>(null);
 
@@ -305,7 +307,12 @@ function App() {
       const reason = error instanceof Error ? error.message : 'Неизвестная ошибка операции.';
       const blocked = recordBlockedAction(portal, action, reason);
       persist(portals.map((item) => (item.id === portal.id ? blocked : item)));
-      setNotice(`Действие отклонено: ${reason}. Попытка записана в журнал.`);
+      if (action === 'stabilize' || action === 'send_observer') {
+        setNotice(null);
+        setRejectedOperation({ action, portalName: portal.name, reason });
+      } else {
+        setNotice(`Действие отклонено: ${reason}. Попытка записана в журнал.`);
+      }
     }
   };
 
@@ -1220,6 +1227,46 @@ function App() {
           </section>
         </div>
       )}
+      {rejectedOperation && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-slate-950/85 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setRejectedOperation(null);
+            }
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="rejected-operation-title"
+            className="w-full max-w-lg rounded-2xl border border-rose-500/50 bg-slate-900 p-6"
+          >
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-rose-300">
+              Операция отклонена
+            </p>
+            <h2 id="rejected-operation-title" className="mt-2 text-xl font-semibold text-white">
+              {actionLabels[rejectedOperation.action]} · {rejectedOperation.portalName}
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-rose-100">
+              {rejectedOperation.reason}
+            </p>
+            <p className="mt-2 text-sm text-slate-300">
+              Портал не изменён. Попытка записана в журнал событий.
+            </p>
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                autoFocus
+                onClick={() => setRejectedOperation(null)}
+                className="rounded-lg bg-rose-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-rose-300"
+              >
+                Понятно
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -1333,7 +1380,7 @@ function Worklog() {
             <li>Первоначальная формула риска увеличивала риск вместе с остатком энергии; энергетический вклад исправлен на рост риска при истощении запаса.</li>
             <li>Ранний ETA не следовал из запаса, а стабилизация произвольно добавляла время. Расчёт привязан к расходу энергии и стабильности.</li>
             <li>При 100% энергии и стабильности прогноз составлял 100 вместо 180 минут. Базовый расход, демо-порталы и миграция стартовых сохранений приведены к 180-минутной шкале.</li>
-            <li>Отказ от операции был заметен главным образом в журнале; добавлено контрастное уведомление с причиной.</li>
+            <li>Отказ в стабилизации или отправке наблюдателя был заметен главным образом в журнале; добавлен всплывающий диалог с причиной, а попытка по-прежнему записывается в журнал.</li>
             <li>В очереди не отображалась отметка «под вопросом» рядом с рекомендацией «Допуск требует проверки»; добавлена короткая отдельная отметка.</li>
             <li>Закрытые порталы исключены из текущего риска и ETA; повторная обработка схлопывания не должна создавать новые потери, а замена демо-итерации сохраняет события в журнале.</li>
           </ul>
