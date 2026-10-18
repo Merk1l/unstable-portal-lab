@@ -6,6 +6,7 @@ import type {
   PortalOperation,
   PortalStatus,
 } from '../types';
+import { normalizePortalName } from './portal-rules';
 
 export const STORAGE_KEY = 'portal-control-system:v1';
 
@@ -86,6 +87,37 @@ function isPortalEnvelope(
     Array.isArray(value.portals) &&
     (value.isDemo === undefined || typeof value.isDemo === 'boolean')
   );
+}
+
+function removeDuplicatePortalNames(portals: Portal[]): Portal[] {
+  const grouped = new Map<string, Portal[]>();
+  for (const portal of portals) {
+    const name = normalizePortalName(portal.name);
+    const group = grouped.get(name) ?? [];
+    group.push(portal);
+    grouped.set(name, group);
+  }
+
+  return [...grouped.values()].map((group) => {
+    const active = group.filter((portal) => portal.currentStatus !== 'closed');
+    const unresolvedIncident = group.find(
+      (portal) =>
+        portal.currentStatus === 'closed' &&
+        (portal.lostOccupants ?? 0) > 0 &&
+        !portal.incidentReviewedAt,
+    );
+    const candidates = unresolvedIncident ? [unresolvedIncident] : active.length > 0 ? active : group;
+    const retained = [...candidates].sort(
+      (left, right) =>
+        Date.parse(right.lastUpdated) - Date.parse(left.lastUpdated),
+    )[0];
+    const eventLog = [
+      ...new Map(
+        group.flatMap((portal) => portal.eventLog).map((event) => [event.id, event]),
+      ).values(),
+    ].sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+    return { ...retained, eventLog };
+  });
 }
 
 function parseOperation(value: unknown): PortalOperation | null {
@@ -348,13 +380,16 @@ export function loadPortals(seed: Portal[]): PortalLoadResult {
     if (!rawPortals) {
       throw new Error('Сохранённые данные имеют неизвестный формат.');
     }
-    const portals = rawPortals.map(parsePortal);
-    if (portals.some((portal) => portal === null)) {
+    const parsedPortals = rawPortals.map(parsePortal);
+    if (parsedPortals.some((portal) => portal === null)) {
       throw new Error('В сохранённых данных есть некорректная запись портала.');
     }
+    const portals = removeDuplicatePortalNames(
+      parsedPortals.filter((portal): portal is Portal => portal !== null),
+    );
     return {
       status: 'loaded',
-      portals: portals.filter((portal): portal is Portal => portal !== null),
+      portals,
       warning: null,
     };
   } catch (error) {

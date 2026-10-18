@@ -56,6 +56,59 @@ describe('модель риска и допуска', () => {
     expect(getRiskLevel(RISK_THRESHOLDS.critical)).toBe('critical');
   });
 
+  it('запрещает повтор имени портала без учёта регистра и лишних пробелов', () => {
+    const existing = { ...basePortal, name: 'Тестовый портал' };
+    expect(() =>
+      createPortal(
+        {
+          name: '  тестовый   портал ',
+          destination: 'Тихая долина',
+          energyLevel: 40,
+          stability: 80,
+          occupants: 0,
+        },
+        [existing],
+      ),
+    ).toThrow('названием уже существует');
+  });
+
+  it('помещает отметку «под вопросом» между высоким и средним риском в очереди внимания', () => {
+    const high: Portal = {
+      ...basePortal,
+      id: 'high',
+      name: 'Высокий риск',
+      energyLevel: 20,
+      stability: 60,
+      timeToCollapseMinutes: 30,
+      occupants: 0,
+    };
+    const questioned: Portal = {
+      ...basePortal,
+      id: 'questioned',
+      name: 'Под вопросом',
+      energyLevel: 80,
+      stability: 90,
+      timeToCollapseMinutes: 100,
+      occupants: 0,
+      underQuestion: true,
+    };
+    const moderate: Portal = {
+      ...basePortal,
+      id: 'moderate',
+      name: 'Средний риск',
+      energyLevel: 40,
+      stability: 40,
+      timeToCollapseMinutes: 180,
+      occupants: 0,
+    };
+
+    expect(
+      summarizePortals([moderate, questioned, high], now).attentionPortals.map(
+        (portal) => portal.id,
+      ),
+    ).toEqual(['high', 'questioned', 'moderate']);
+  });
+
   it('учитывает сокращение времени и количество находящихся внутри', () => {
     const safe = {
       ...basePortal,
@@ -162,7 +215,7 @@ describe('асинхронные операции', () => {
     expect(DEMO_PORTAL_REOPEN_DELAY_MS).toBe(150 * 60_000);
   });
 
-  it('перезапускает закрытый демо-портал через 2,5 часа, сохраняя закрытую итерацию', () => {
+  it('перезапускает демо-портал через 2,5 часа и заменяет закрытую итерацию', () => {
     const template: Portal = {
       ...basePortal,
       id: 'demo-portal',
@@ -174,6 +227,14 @@ describe('асинхронные операции', () => {
       ...template,
       currentStatus: 'closed',
       closedAt: new Date(now - DEMO_PORTAL_REOPEN_DELAY_MS).toISOString(),
+      eventLog: [{
+        id: 'closed-cycle-event',
+        timestamp: new Date(now - DEMO_PORTAL_REOPEN_DELAY_MS).toISOString(),
+        portalId: template.id,
+        action: 'natural_collapse',
+        result: 'completed',
+        description: 'Закрытая итерация.',
+      }],
     };
 
     const beforeDelay = advanceDemoPortalCycles(
@@ -184,9 +245,8 @@ describe('асинхронные операции', () => {
     expect(beforeDelay).toHaveLength(1);
 
     const reopened = advanceDemoPortalCycles([closed], [template], now);
-    expect(reopened).toHaveLength(2);
-    expect(reopened[0]).toBe(closed);
-    expect(reopened[1]).toMatchObject({
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0]).toMatchObject({
       id: 'demo-portal-cycle-1',
       currentStatus: 'open',
       pendingOperation: null,
@@ -194,8 +254,42 @@ describe('асинхронные операции', () => {
       occupants: template.occupants,
       energyUpdatedAt: new Date(now).toISOString(),
     });
-    expect(reopened[1].eventLog[0].description).toContain('итерация 1');
+    expect(reopened[0].eventLog.map((event) => event.id)).toContain(
+      'closed-cycle-event',
+    );
+    expect(reopened[0].eventLog.at(-1)?.description).toContain('итерация 1');
+    expect(reopened.some((portal) => portal.name === closed.name && portal.currentStatus === 'closed')).toBe(false);
     expect(advanceDemoPortalCycles(reopened, [template], now + 1)).toBe(reopened);
+  });
+
+  it('не удаляет непросмотренное происшествие ради автоматического цикла', () => {
+    const template: Portal = {
+      ...basePortal,
+      id: 'demo-incident-portal',
+      currentStatus: 'open',
+      pendingOperation: null,
+      closedAt: null,
+    };
+    const closed: Portal = {
+      ...template,
+      currentStatus: 'closed',
+      closedAt: new Date(now - DEMO_PORTAL_REOPEN_DELAY_MS).toISOString(),
+      lostOccupants: 1,
+      incidentReviewedAt: null,
+    };
+
+    expect(advanceDemoPortalCycles([closed], [template], now)).toEqual([closed]);
+    const reviewed = {
+      ...closed,
+      incidentReviewedAt: new Date(now - 1_000).toISOString(),
+    };
+    const reopened = advanceDemoPortalCycles([reviewed], [template], now);
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0].currentStatus).toBe('open');
+    expect(reopened[0].eventLog.slice(0, reviewed.eventLog.length)).toEqual(
+      reviewed.eventLog,
+    );
+    expect(reopened[0].eventLog.at(-1)?.description).toContain('итерация 1');
   });
 
   it('не перезапускает созданные пользователем порталы', () => {
@@ -392,7 +486,7 @@ describe('асинхронные операции', () => {
     expect(cleared.eventLog[0].description).toContain('снята');
   });
 
-  it('наблюдатель входит на 10 минут, учитывается внутри, возвращается и снимает требование проверки', () => {
+  it('наблюдатель входит на 5 минут, учитывается внутри, возвращается и снимает требование проверки', () => {
     const needsCheck: Portal = {
       ...basePortal,
       energyLevel: 20,
@@ -864,6 +958,73 @@ describe('хранилище порталов', () => {
       status: 'loaded',
       portals: [],
     });
+  });
+
+  it('при загрузке удаляет закрытый архивный дубль и сохраняет его события у активного портала', () => {
+    const closed: Portal = {
+      ...basePortal,
+      id: 'portal-closed-cycle',
+      currentStatus: 'closed',
+      closedAt: new Date(now - 60_000).toISOString(),
+      eventLog: [{
+        id: 'closed-cycle-incident',
+        timestamp: new Date(now - 60_000).toISOString(),
+        portalId: 'portal-closed-cycle',
+        action: 'collapse_incident',
+        result: 'critical',
+        description: 'Происшествие старой итерации.',
+      }],
+    };
+    const active: Portal = {
+      ...basePortal,
+      name: `  ${basePortal.name.toLocaleUpperCase('ru-RU')}  `,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [closed, active] }),
+    );
+
+    const loaded = loadPortals([]);
+    expect(loaded.portals).toHaveLength(1);
+    expect(loaded.portals[0].currentStatus).toBe('open');
+    expect(loaded.portals[0].eventLog.map((event) => event.id)).toContain(
+      'closed-cycle-incident',
+    );
+  });
+
+  it('при очистке дублей сохраняет закрытый портал с непросмотренной потерей в очереди происшествий', () => {
+    const timestamp = new Date(now).toISOString();
+    const closed: Portal = {
+      ...basePortal,
+      id: 'unreviewed-closed',
+      currentStatus: 'closed',
+      closedAt: timestamp,
+      lostOccupants: 1,
+      incidentReviewedAt: null,
+      eventLog: [{
+        id: 'unreviewed-incident-event',
+        timestamp,
+        portalId: 'unreviewed-closed',
+        action: 'collapse_incident',
+        result: 'critical',
+        description: 'Потерян 1 человек/существо.',
+      }],
+    };
+    const active: Portal = {
+      ...basePortal,
+      id: 'same-name-active',
+      name: ` ${basePortal.name.toLocaleUpperCase('ru-RU')} `,
+      lastUpdated: new Date(now + 1_000).toISOString(),
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [active, closed] }),
+    );
+
+    const loaded = loadPortals([]);
+    expect(loaded.portals).toHaveLength(1);
+    expect(loaded.portals[0].id).toBe('unreviewed-closed');
+    expect(summarizePortals(loaded.portals, now).attentionPortals).toHaveLength(1);
   });
 
   it('добавляет новые поля наблюдения при чтении старого формата сохранённых порталов', () => {

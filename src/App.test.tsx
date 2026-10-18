@@ -20,6 +20,7 @@ describe('панель управления', () => {
     render(<App />);
     expect(screen.getAllByRole('button').some((button) => button.textContent?.includes('A1'))).toBe(true);
     expect(screen.getByText('Очередь внимания')).toBeInTheDocument();
+    expect(screen.getByText(/За минуту: выберите портал/)).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: 'Восстановить демо-данные' }),
     ).toBeInTheDocument();
@@ -57,6 +58,64 @@ describe('панель управления', () => {
     );
   });
 
+  it('запрещает создавать портал с уже занятым названием', () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [INITIAL_PORTALS[0]] }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Добавить портал' })[0]);
+    fireEvent.change(screen.getByLabelText('Название'), {
+      target: { value: `  ${INITIAL_PORTALS[0].name.toLocaleLowerCase('ru-RU')} ` },
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent('уже существует');
+    expect(screen.getByRole('button', { name: 'Создать запись' })).toBeDisabled();
+  });
+
+  it('не скрывает портал «под вопросом» за первыми тремя элементами очереди', () => {
+    const timestamp = new Date().toISOString();
+    const highRiskPortals = ['high-1', 'high-2', 'high-3'].map((id, index) => ({
+      ...INITIAL_PORTALS[1],
+      id,
+      name: `Высокий риск ${index + 1}`,
+      energyLevel: 20,
+      energyUpdatedAt: timestamp,
+      baseEnergyDrainPerMinute: 1,
+      stability: 40,
+      timeToCollapseMinutes: 30,
+      collapseEstimateUpdatedAt: timestamp,
+      collapseDeadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      occupants: 0,
+      underQuestion: false,
+    }));
+    const questioned = {
+      ...INITIAL_PORTALS[1],
+      id: 'questioned',
+      name: 'Проверить этот портал',
+      energyLevel: 80,
+      energyUpdatedAt: timestamp,
+      baseEnergyDrainPerMinute: 1,
+      stability: 90,
+      timeToCollapseMinutes: 180,
+      collapseEstimateUpdatedAt: timestamp,
+      collapseDeadlineAt: new Date(Date.now() + 180 * 60_000).toISOString(),
+      occupants: 0,
+      underQuestion: true,
+    };
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ schemaVersion: 1, portals: [...highRiskPortals, questioned] }),
+    );
+    render(<App />);
+
+    const attentionItems = screen.getAllByRole('button').filter((button) =>
+      button.textContent?.includes('Приоритет '),
+    );
+    expect(attentionItems).toHaveLength(4);
+    expect(attentionItems[3]).toHaveTextContent('Проверить этот портал');
+  });
+
   it('восстанавливает демо-данные только после явного подтверждения', async () => {
     const customPortal = {
       ...INITIAL_PORTALS[1],
@@ -77,7 +136,7 @@ describe('панель управления', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Восстановить демо-данные' }));
     fireEvent.click(screen.getByRole('button', { name: 'Подтвердить сброс' }));
     expect(screen.getByText(/Демонстрационные данные восстановлены/)).toBeInTheDocument();
-    expect(screen.getByText('Закрытые стартовые порталы автоматически возвращаются новой итерацией через 2 ч 30 мин; архивная история сохраняется.')).toBeInTheDocument();
+    expect(screen.getByText(/Стартовые демо-порталы циклично/)).toBeInTheDocument();
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).not.toContain('user-created-portal'),
     );
@@ -86,12 +145,12 @@ describe('панель управления', () => {
     )).toBe(true);
   });
 
-  it('показывает встроенный Worklog и честно сообщает о неизвестном времени и токенах', () => {
+  it('показывает встроенный Worklog с оценкой времени и статистикой токенов', () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: 'AI Worklog' }));
 
     expect(screen.getByRole('heading', { name: 'AI Worklog' })).toBeInTheDocument();
-    expect(screen.getByText(/Общее время разработки надёжно не фиксировалось/)).toBeInTheDocument();
+    expect(screen.getByText('Около 6 часов.')).toBeInTheDocument();
     expect(screen.getByText(/Количество токенов не измерялось/)).toBeInTheDocument();
   });
 
@@ -187,11 +246,14 @@ describe('панель управления', () => {
     render(<App />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Отправить наблюдателя' }));
-    expect(screen.getByRole('status')).toHaveTextContent('вошёл в портал на 10 минут');
+    expect(screen.getByRole('status')).toHaveTextContent('вошёл в портал на 5 минут');
     expect(screen.getByText(/До завершения: \d+:\d{2}/)).toBeInTheDocument();
     await waitFor(() =>
       expect(window.localStorage.getItem(STORAGE_KEY)).toContain('"kind":"observer"'),
     );
+    const savedPortals = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').portals;
+    const observer = savedPortals[0].pendingOperation;
+    expect(Date.parse(observer.completesAt) - Date.parse(observer.startedAt)).toBe(5 * 60_000);
   });
 
   it('возвращает действие «под вопросом» и даёт снять отметку', () => {

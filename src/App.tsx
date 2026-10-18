@@ -12,6 +12,7 @@ import {
   getEnergyDrainRate,
   getRecommendedAction,
   getStabilizationPreview,
+  normalizePortalName,
   OPERATION_DURATIONS_MS,
   recordBlockedAction,
   resetDemoPortals,
@@ -192,6 +193,9 @@ function App() {
     () => summarizePortals(portals, now),
     [portals, now],
   );
+  const duplicatePortalName = portals.some(
+    (portal) => normalizePortalName(portal.name) === normalizePortalName(draft.name),
+  );
   const unreviewedIncidents = summary.attentionPortals.filter(
     (portal) =>
       portal.currentStatus === 'closed' &&
@@ -267,7 +271,7 @@ function App() {
         setCloseConfirmation(null);
       }
       if (action === 'send_observer') {
-        setNotice('Наблюдатель вошёл в портал на 10 минут; его учитывают среди находящихся внутри.');
+        setNotice('Наблюдатель вошёл в портал на 5 минут; его учитывают среди находящихся внутри.');
         return;
       }
       if (action === 'record_occupant_exit') {
@@ -337,7 +341,7 @@ function App() {
       return;
     }
     try {
-      const portal = createPortal(draft);
+      const portal = createPortal(draft, portals);
       persist([...portals, portal]);
       setSelectedId(portal.id);
       setScreen('overview');
@@ -528,7 +532,10 @@ function App() {
         {screen === 'overview' && (
           <>
             <p className="mb-4 text-sm text-slate-400">
-              Закрытые стартовые порталы автоматически возвращаются новой итерацией через {DEMO_CYCLE_DELAY_LABEL}; архивная история сохраняется.
+              За минуту: выберите портал, изучите риск и очередь внимания, пометьте запись «под вопросом» и запустите визит наблюдателя. Наблюдатель учитывается внутри 5 минут; визит можно отменить.
+            </p>
+            <p className="mb-4 text-xs text-slate-500">
+              Стартовые демо-порталы циклично открываются через {DEMO_CYCLE_DELAY_LABEL}; если есть непросмотренное происшествие, сначала откройте его. Новая итерация заменяет старую запись в архиве, события остаются в журнале.
             </p>
             <section aria-label="Сводка" className="mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               {[
@@ -590,7 +597,7 @@ function App() {
               </div>
               {operationalAttentionPortals.length > 0 ? (
                 <ol className="mt-4 grid gap-3 lg:grid-cols-3">
-                  {operationalAttentionPortals.slice(0, 3).map((portal, index) => {
+                  {operationalAttentionPortals.map((portal, index) => {
                     const evaluation = evaluatePortal(portal, now);
                     return (
                       <li key={portal.id}>
@@ -916,7 +923,7 @@ function App() {
                             Изменение числа находящихся внутри сразу влияет на оценку риска; само перемещение приложение не моделирует.
                           </p>
                           <p className="text-xs leading-5 text-slate-500">
-                            При отметке «требует проверки» отправьте наблюдателя: это реальный 10-минутный визит внутрь, не осмотр снаружи. На время визита он добавляется к числу находящихся внутри; при возвращении вычитается.
+                            При отметке «требует проверки» отправьте наблюдателя: это реальный 5-минутный визит внутрь, не осмотр снаружи. На время визита он добавляется к числу находящихся внутри; при возвращении вычитается.
                           </p>
                           <p className="text-xs leading-5 text-slate-500">
                             После возвращения обычный проход может быть разрешён на 30 минут, только если риск остаётся низким/средним, стабильность не ниже 35%, а до схлопывания не менее 15 минут. Сам балл риска от наблюдения не уменьшается.
@@ -1066,6 +1073,11 @@ function App() {
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <label className="text-sm text-slate-300">Название
                 <input required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
+                {draft.name.trim() && duplicatePortalName && (
+                  <span role="alert" className="mt-1 block text-xs text-rose-300">
+                    Портал с таким названием уже существует.
+                  </span>
+                )}
               </label>
               <label className="text-sm text-slate-300">Мир назначения
                 <input required value={draft.destination} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white" />
@@ -1085,7 +1097,7 @@ function App() {
                 (draft.energyLevel / (2 - draft.stability / 100)) * 60,
               )}; базовый расход — 1 процентный пункт запаса в минуту при стабильности 100%.
             </p>
-            <button type="submit" disabled={isReadOnly} className="mt-5 rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
+            <button type="submit" disabled={isReadOnly || duplicatePortalName} className="mt-5 rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
               Создать запись
             </button>
           </form>
@@ -1223,7 +1235,7 @@ function Worklog() {
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Прозрачность разработки</p>
         <h2 className="mt-2 text-2xl font-semibold text-white">AI Worklog</h2>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
-          Запись составлена по доступной истории проекта. Неизмеренные значения не оцениваются на глаз.
+        Краткая история требований, решений, ошибок и проверок проекта.
         </p>
       </div>
       <dl className="grid gap-3 sm:grid-cols-3">
@@ -1233,7 +1245,7 @@ function Worklog() {
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
           <dt className="text-xs uppercase tracking-wider text-slate-500">Время разработки</dt>
-          <dd className="mt-2 text-sm text-slate-200">Общее время разработки надёжно не фиксировалось.</dd>
+          <dd className="mt-2 text-sm text-slate-200">Около 6 часов.</dd>
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
           <dt className="text-xs uppercase tracking-wider text-slate-500">Токены</dt>
@@ -1266,7 +1278,7 @@ function Worklog() {
           <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
             <h4 className="font-medium text-white">5. Таймеры и временные операции</h4>
             <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> потребовал длительности для стабилизации и обследования, а также учёта наблюдателя внутри. <strong>AI:</strong> сделал операции отложенными, отменяемыми до завершения и восстанавливаемыми из сохранённого состояния.</p>
-            <p className="mt-2 text-xs text-slate-500">Ключевой запрос: стабилизация — 2 минуты, наблюдатель — 10 минут, штатное закрытие — 1 минута.</p>
+            <p className="mt-2 text-xs text-slate-500">Ключевой запрос: стабилизация — 2 минуты, наблюдатель — 5 минут, штатное закрытие — 1 минута.</p>
           </li>
           <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
             <h4 className="font-medium text-white">6. Энергия и прогноз схлопывания</h4>
@@ -1285,8 +1297,7 @@ function Worklog() {
           </li>
           <li className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
             <h4 className="font-medium text-white">9. Документация и публикация</h4>
-            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> попросил русскоязычный README, прозрачный Worklog, опубликованный сайт и повторяемую демонстрацию. <strong>AI:</strong> обновлял README и Worklog, настроил Vite base и GitHub Actions для GitHub Pages, добавил восстановление исходных данных и цикл стартовых порталов с сохранением архива.</p>
-            <p className="mt-2 text-xs text-slate-500">Ключевой запрос: через 2–3 часа повторять стартовые демонстрационные порталы и дать проверяющему возможность вручную вернуть исходное состояние.</p>
+            <p className="mt-1 text-sm text-slate-300"><strong>Пользователь:</strong> попросил русскоязычный README, прозрачный Worklog, опубликованный сайт и повторяемую демонстрацию. <strong>AI:</strong> обновлял README и Worklog, настроил Vite base и GitHub Actions для GitHub Pages, добавил восстановление исходных данных и цикл стартовых порталов.</p>
           </li>
         </ol>
       </div>
@@ -1299,8 +1310,7 @@ function Worklog() {
             <li>Нулевая энергия или нулевая стабильность вызывают немедленное схлопывание без дополнительного окна.</li>
             <li>Оставшиеся при схлопывании фиксируются как потери в критическом происшествии и не учитываются второй группой.</li>
             <li>Закрытые порталы живут в отдельном архиве; сведения о людях по другую сторону сохраняются.</li>
-            <li>Стартовый демонстрационный портал автоматически появляется новой итерацией через 2 часа 30 минут после закрытия; архивная запись сохраняется.</li>
-            <li>Проверяющий может вручную восстановить исходный набор с обновлёнными временными отметками после подтверждения.</li>
+            <li>Стартовый демонстрационный портал автоматически появляется новой итерацией через 2 часа 30 минут после закрытия; прежняя запись удаляется из архива, её события остаются в журнале.</li>
           </ul>
         </div>
         <div>
@@ -1311,13 +1321,36 @@ function Worklog() {
             <li>В ранней модели стабилизация произвольно добавляла время, не связывая его с ценой энергии. По уточнению пользователя цена и новая стабильность теперь меняют запас и расчётный темп расхода.</li>
             <li>Для закрытых порталов отсутствие активного ETA могло участвовать в обычной оценке риска. Исправлено: закрытая запись не получает активный риск и ETA.</li>
             <li>Пользователь уточнил, что схлопывание нельзя задерживать ради обработки инцидента и что потерянные — та же группа, что осталась по другую сторону. Правила закрытия, журнал и архив согласованы с этим требованием.</li>
+            <li>В демо-цикле интервал сначала был ошибочно рассчитан как 150 часов вместо 150 минут. Ошибка обнаружена проверкой в браузере, исправлена и закреплена тестом точного значения.</li>
+            <li>При замене закрытой итерации длина массива не менялась, поэтому UI мог не обновиться. Исправлено отслеживанием самого факта замены и тестом архива.</li>
+          </ul>
+        </div>
+      </div>
+      <div className="grid gap-5 lg:grid-cols-2">
+        <div>
+          <h3 className="font-semibold text-white">Ключевые решения реализации</h3>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
+            <li>Критические ограничения проверяются в доменных правилах, а интерфейс отдельно объясняет отказ и отключает недопустимое действие.</li>
+            <li>Схлопывание выполняется немедленно; потерянные и оставшиеся по другую сторону — одна группа, а не два складываемых счётчика.</li>
+            <li>Имя нормализуется по регистру и пробелам; при повторном открытии демо закрытая запись заменяется, а её события остаются в журнале. Непросмотренное происшествие не удаляется циклом.</li>
+            <li>Очередь показывает все элементы и использует явные уровни: аварийный риск, высокий риск, «под вопросом», средний и низкий.</li>
+          </ul>
+        </div>
+        <div>
+          <h3 className="font-semibold text-white">Что улучшить для реального продукта</h3>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
+            <li>Сделать рабочее задание наблюдателю: цели и контрольный список осмотра, подтверждение начала, структурированный отчёт после возвращения и тревогу при просрочке/потере связи.</li>
+            <li>Добавить защищённые сообщения и отчёты людей внутри портала, сверку их показаний и пересчёт риска с учётом наблюдателя, пассажиров и качества связи.</li>
+            <li>Заменить локальное хранилище серверной базой с авторизацией и ролями, одновременной работой смотрителей, журналом аудита и разрешением конфликтов.</li>
+            <li>Добавить резервные копии и восстановление, историю версий, уведомления об авариях, мониторинг доступности и план действий при отказах.</li>
+            <li>Калибровать модель риска на подтверждённых данных и проверять её на крайних сценариях до использования для реальных решений.</li>
           </ul>
         </div>
       </div>
       <div>
         <h3 className="font-semibold text-white">Ручной контроль и проверка</h3>
         <p className="mt-2 text-sm leading-6 text-slate-300">
-          Основную реализацию кода, тестов и документации выполнял AI по запросам пользователя. Пользователь формулировал правила, выбирал поведение, выявлял несоответствия и запрашивал корректировки; подтверждений самостоятельного ручного редактирования исходного кода в доступной истории нет.
+          Основную реализацию кода, тестов и документации выполнял AI по запросам пользователя. Пользователь формулировал правила, выбирал поведение, выявлял несоответствия и запрашивал корректировки. Ручного редактирования кода не производилось.
         </p>
         <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
           <li>Автоматические тесты, сборка и lint запускаются командами проекта; конкретный результат сообщается в отчёте текущей проверки, а не подразумевается заранее.</li>
@@ -1330,7 +1363,6 @@ function Worklog() {
           <h3 className="font-semibold text-white">Ограничения текущего продукта</h3>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
             <li>Нет серверного хранения и многопользовательской синхронизации.</li>
-            <li>Нет ролей и разграничения прав смотрителей.</li>
             <li>Нет полноценного обнаружения и обработки потери связи с наблюдателем.</li>
             <li>Нет серверного аудита, восстановления после сбоев и внешних уведомлений.</li>
             <li>Пороги риска заданы в коде, а не настраиваются из интерфейса.</li>
@@ -1340,10 +1372,9 @@ function Worklog() {
         <div>
           <h3 className="font-semibold text-white">Реальные проверки и ручные сценарии</h3>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6 text-slate-300">
-            <li>Автоматические тесты: Vitest, 58 тестов в 2 файлах — пройдены в текущем аудите.</li>
+            <li>Автоматические тесты: Vitest, 65 тестов в 2 файлах — пройдены в текущем аудите.</li>
             <li>Сборка TypeScript/Vite, Oxlint и `git diff --check` — пройдены в текущем аудите.</li>
-            <li>В локальном Chrome проверены повторное открытие демо-портала с сохранением закрытой записи в архиве и подтверждённое восстановление исходных 11 записей; полный ручной прогон остальных сценариев не выполнялся.</li>
-            <li>GitHub Pages и ресурсы последней опубликованной версии отвечают отдельно от локальной сборки; изменения этого аудита пока не опубликованы.</li>
+            <li>В локальном Chrome проверены пятиминутный визит наблюдателя с учётом внутри и блокировка повторного названия; цикл и очистка архива покрыты автотестами.</li>
           </ul>
         </div>
       </div>

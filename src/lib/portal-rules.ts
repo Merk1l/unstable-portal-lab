@@ -42,7 +42,7 @@ export const ENERGY_COST_PER_STABILIZATION = 12;
 export const STABILITY_GAIN_PER_STABILIZATION = 20;
 export const STABILITY_LOSS_PER_ENTRY = 1;
 export const DEMO_PORTAL_REOPEN_DELAY_MS = 150 * MINUTE_MS;
-export const OBSERVER_VISIT_DURATION_MS = 10 * MINUTE_MS;
+export const OBSERVER_VISIT_DURATION_MS = 5 * MINUTE_MS;
 export const OBSERVER_CLEARANCE_VALID_MS = 30 * MINUTE_MS;
 export const OPERATION_DURATIONS_MS: Record<PortalOperationKind, number> = {
   stabilize: 2 * 60_000,
@@ -50,6 +50,10 @@ export const OPERATION_DURATIONS_MS: Record<PortalOperationKind, number> = {
   review: 2 * 60_000,
   observer: OBSERVER_VISIT_DURATION_MS,
 };
+
+export function normalizePortalName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+}
 
 export function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -276,7 +280,7 @@ export function getRecommendedAction(portal: Portal, now = Date.now()): string {
     return `Критический риск: вход, включая отправку наблюдателя, запрещён. ${exitInstruction}${stabilizationAdvice} До схлопывания ${Math.ceil((evaluation.remainingSeconds ?? 0) / 60)} мин.; внутри ${portal.occupants}.`;
   }
   if (evaluation.riskLevel === 'high') {
-    return 'Высокий риск: обычный проход запрещён. Наблюдателя можно отправить на 10 минут только при стабильности не ниже 35%, запасе времени от 15 минут и если его учёт не поднимет риск до критического.';
+    return 'Высокий риск: обычный проход запрещён. Наблюдателя можно отправить на 5 минут только при стабильности не ниже 35%, запасе времени от 15 минут и если его учёт не поднимет риск до критического.';
   }
   if (evaluation.accessDecision === 'forbidden') {
     return `Проход запрещён. ${exitInstruction}Начать стабилизацию и проверить безопасность находящихся внутри (${portal.occupants}).`;
@@ -285,7 +289,7 @@ export function getRecommendedAction(portal: Portal, now = Date.now()): string {
     return 'Портал ожидает решения смотрителя. Для обследования изнутри отправьте наблюдателя, если это допускают риск и таймер.';
   }
   if (evaluation.accessDecision === 'requires_check') {
-    return 'Допуск требует проверки. Отправьте наблюдателя на 10 минут; его вход учитывается в числе находящихся внутри. После возвращения допуск пересчитается.';
+    return 'Допуск требует проверки. Отправьте наблюдателя на 5 минут; его вход учитывается в числе находящихся внутри. После возвращения допуск пересчитается.';
   }
   if (portal.underQuestion) {
     return 'Портал помечен «под вопросом». Изучите журнал и показатели; при необходимости отправьте наблюдателя.';
@@ -332,9 +336,16 @@ export function summarizePortals(portals: Portal[], now = Date.now()) {
       }
       const leftEvaluation = evaluatePortal(left, now);
       const rightEvaluation = evaluatePortal(right, now);
+      const priority = (portal: Portal, riskLevel: RiskLevel) => {
+        if (portal.currentStatus === 'collapsing' || riskLevel === 'critical') return 0;
+        if (riskLevel === 'high') return 1;
+        if (portal.underQuestion) return 2;
+        if (riskLevel === 'moderate') return 3;
+        return 4;
+      };
       return (
-        Number(right.currentStatus === 'collapsing') -
-          Number(left.currentStatus === 'collapsing') ||
+        priority(left, leftEvaluation.riskLevel) -
+          priority(right, rightEvaluation.riskLevel) ||
         rightEvaluation.riskScore - leftEvaluation.riskScore ||
         right.occupants - left.occupants ||
         (leftEvaluation.remainingSeconds ?? Number.POSITIVE_INFINITY) -
@@ -432,11 +443,19 @@ function collapseImmediately(
   return withEvent(closed, 'natural_collapse', 'completed', closed.notes, happenedAt);
 }
 
-export function createPortal(draft: PortalDraft): Portal {
+export function createPortal(draft: PortalDraft, existingPortals: Portal[] = []): Portal {
   const name = draft.name.trim();
   const destination = draft.destination.trim();
   if (!name || !destination) {
     throw new Error('Укажите название портала и мир назначения.');
+  }
+  const normalizedName = normalizePortalName(name);
+  if (
+    existingPortals.some(
+      (portal) => normalizePortalName(portal.name) === normalizedName,
+    )
+  ) {
+    throw new Error('Портал с таким названием уже существует. Укажите уникальное название.');
   }
   if (
     !Number.isFinite(draft.energyLevel) ||
@@ -523,6 +542,7 @@ export function advanceDemoPortalCycles(
 ): Portal[] {
   const nextPortals = [...portals];
   const timestamp = new Date(now).toISOString();
+  let changed = false;
 
   for (const template of templates) {
     const cyclePrefix = `${template.id}-cycle-`;
@@ -542,8 +562,21 @@ export function advanceDemoPortalCycles(
     if (
       !Number.isFinite(lastClosedAt) ||
       now < lastClosedAt + DEMO_PORTAL_REOPEN_DELAY_MS ||
+      instances.some(
+        (portal) =>
+          (portal.lostOccupants ?? 0) > 0 && !portal.incidentReviewedAt,
+      ) ||
       template.energyLevel <= 0 ||
       template.stability <= 0
+    ) {
+      continue;
+    }
+    if (
+      nextPortals.some(
+        (portal) =>
+          !instances.includes(portal) &&
+          normalizePortalName(portal.name) === normalizePortalName(template.name),
+      )
     ) {
       continue;
     }
@@ -571,22 +604,28 @@ export function advanceDemoPortalCycles(
       closedAt: null,
       closureReason: null,
       observerVerifiedAt: null,
-      notes: 'Автоматически открыта новая демонстрационная итерация. Предыдущие записи сохранены в архиве.',
+      notes: 'Автоматически открыта новая демонстрационная итерация. События предыдущих записей сохранены в журнале.',
       eventLog: [
+        ...new Map(
+          instances.flatMap((portal) => portal.eventLog).map((event) => [event.id, event]),
+        ).values(),
         {
-          id: `${id}:${timestamp}:0`,
+          id: `${id}:${timestamp}:cycle`,
           timestamp,
           portalId: id,
           action: 'create_portal',
           result: 'completed',
-          description: `Автоматически открыта демонстрационная итерация ${cycleNumber}; предыдущая запись сохранена в архиве.`,
+          description: `Автоматически открыта демонстрационная итерация ${cycleNumber}; предыдущая запись удалена из архива, события сохранены в журнале.`,
         },
       ],
     };
-    nextPortals.push(reopened);
+    const instanceIds = new Set(instances.map((portal) => portal.id));
+    const retainedPortals = nextPortals.filter((portal) => !instanceIds.has(portal.id));
+    nextPortals.splice(0, nextPortals.length, ...retainedPortals, reopened);
+    changed = true;
   }
 
-  return nextPortals.length === portals.length ? portals : nextPortals;
+  return changed ? nextPortals : portals;
 }
 
 export function recordBlockedAction(portal: Portal, action: PortalAction, reason: string): Portal {
@@ -621,7 +660,7 @@ function startOperation(
     stabilize: 'Стабилизация начата; расчётная длительность — 2 минуты.',
     close: 'Закрытие начато; расчётная длительность — 1 минута.',
     review: 'Ручная проверка начата.',
-    observer: 'Наблюдатель вошёл в портал; расчётная длительность пребывания — 10 минут.',
+    observer: 'Наблюдатель вошёл в портал; расчётная длительность пребывания — 5 минут.',
   };
   return {
     ...updated,
